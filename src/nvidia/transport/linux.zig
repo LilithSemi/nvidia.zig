@@ -34,7 +34,7 @@ pub const Transport = struct {
     /// ABI can be selected before any further RM calls).
     pub fn open() Error!Transport {
         const rc = std.os.linux.open(control_device, .{ .ACCMODE = .RDWR }, 0);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.OpenFailed,
         }
@@ -104,7 +104,7 @@ pub const Transport = struct {
             p.status = 0;
             p.h_object_new = h_new;
             const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&p));
-            switch (std.posix.errno(rc)) {
+            switch (std.os.linux.errno(rc)) {
                 .SUCCESS => {},
                 else => return error.IoctlFailed,
             }
@@ -127,7 +127,7 @@ pub const Transport = struct {
         var cards = [_]sdk.CardInfo{std.mem.zeroes(sdk.CardInfo)} ** sdk.NV_MAX_DEVICES;
         const req = std.os.linux.IOCTL.IOWR(ioctl.NV_IOCTL_MAGIC, @intCast(ioctl.NV_ESC_CARD_INFO), [sdk.NV_MAX_DEVICES]sdk.CardInfo);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&cards));
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.IoctlFailed,
         }
@@ -140,7 +140,7 @@ pub const Transport = struct {
         var ids = [_]sdk.NvU32{ gpu_id, 0 };
         const req = std.os.linux.IOCTL.IOWR(ioctl.NV_IOCTL_MAGIC, @intCast(ioctl.NV_ESC_ATTACH_GPUS_TO_FD), [2]sdk.NvU32);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&ids));
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.IoctlFailed,
         }
@@ -152,7 +152,7 @@ pub const Transport = struct {
         var buf: [32]u8 = undefined;
         const path = std.fmt.bufPrintZ(&buf, "/dev/nvidia{d}", .{minor}) catch return error.OpenFailed;
         const rc = std.os.linux.open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.OpenFailed,
         }
@@ -160,7 +160,7 @@ pub const Transport = struct {
         var reg = sdk.RegisterFd{ .ctl_fd = self.fd };
         const req = std.os.linux.IOCTL.IOWR(ioctl.NV_IOCTL_MAGIC, @intCast(ioctl.NV_ESC_REGISTER_FD), sdk.RegisterFd);
         const reg_rc = std.os.linux.ioctl(node_fd, req, @intFromPtr(&reg));
-        switch (std.posix.errno(reg_rc)) {
+        switch (std.os.linux.errno(reg_rc)) {
             .SUCCESS => {},
             else => {
                 _ = std.os.linux.close(node_fd);
@@ -234,7 +234,7 @@ pub const Transport = struct {
         switch (location) {
             .system, .system_wc => {
                 const rc = std.os.linux.open(control_device, .{ .ACCMODE = .RDWR }, 0);
-                switch (std.posix.errno(rc)) {
+                switch (std.os.linux.errno(rc)) {
                     .SUCCESS => {},
                     else => return error.OpenFailed,
                 }
@@ -266,14 +266,14 @@ pub const Transport = struct {
         };
         const req = std.os.linux.IOCTL.IOWR(ioctl.NV_IOCTL_MAGIC, @intCast(ioctl.NV_ESC_RM_MAP_MEMORY), sdk.Nvos33WithFd);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&w));
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.IoctlFailed,
         }
         if (w.params.status != 0) return error.MapFailed;
 
         const m = std.os.linux.mmap(null, mem.size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
-        switch (std.posix.errno(m)) {
+        switch (std.os.linux.errno(m)) {
             .SUCCESS => {},
             else => return error.MapFailed,
         }
@@ -302,7 +302,7 @@ pub const Transport = struct {
         };
         const req = ioctl.iowr(ioctl.NV_ESC_RM_CONTROL, sdk.Os54Params);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&p));
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.IoctlFailed,
         }
@@ -342,7 +342,7 @@ pub const Transport = struct {
         };
         const req = ioctl.iowr(ioctl.NV_ESC_RM_MAP_MEMORY_DMA, sdk.Os46Params);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&p));
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             else => return error.IoctlFailed,
         }
@@ -367,7 +367,7 @@ fn checkVersionFd(fd: std.posix.fd_t, cmd: sdk.NvU32, ver: []const u8) Error!sdk
     @memcpy(p.version_string[0..n], ver[0..n]);
     const req = ioctl.iowr(ioctl.NV_ESC_CHECK_VERSION_STR, sdk.RmApiVersion);
     const rc = std.os.linux.ioctl(fd, req, @intFromPtr(&p));
-    switch (std.posix.errno(rc)) {
+    switch (std.os.linux.errno(rc)) {
         .SUCCESS => {},
         else => return error.IoctlFailed,
     }
