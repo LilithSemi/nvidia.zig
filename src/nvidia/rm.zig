@@ -18,6 +18,7 @@ const std = @import("std");
 const sdk = @import("sdk.zig");
 const version = @import("version.zig");
 const transport = @import("transport.zig");
+const drm = @import("drm.zig");
 
 const Transport = transport.Transport;
 
@@ -613,6 +614,60 @@ test "live: channel submission control-plane (bind/schedule/token/usermode)" {
     const door = try c.mapMemory(dev, .{ .handle = usermode, .size = 0x1000, .location = .vram });
     defer c.unmapMemory(door);
     try std.testing.expect(door.bytes.len >= 0x1000);
+}
+
+test "live: memToDmaBuf: system memory -> real dma-buf fd" {
+    var c = try openOrSkip();
+    defer c.deinit();
+    const dev = c.allocDevice(0) catch |e| switch (e) {
+        error.OpenFailed, error.NoDevice => return error.SkipZigTest,
+        else => return e,
+    };
+    defer c.freeDevice(dev);
+
+    // Allocate SYSTEM memory: get_user_pages requires real CPU-visible pages.
+    // 64x64 RGBA = 16384 bytes, rounds up to 1 page.
+    const size: u64 = 64 * 64 * 4;
+    const mem = try c.allocMemory(dev, .system, size);
+    defer c.freeMemory(dev, mem);
+
+    // Map it to get a CPU virtual address. Keep alive until after dma-buf consumer is done.
+    const mapping = try c.mapMemory(dev, mem);
+    defer c.unmapMemory(mapping);
+    const va: usize = @intFromPtr(mapping.bytes.ptr);
+
+    // Turn the CPU VA into a real dma-buf fd via the nvidia-drm render node.
+    const dmabuf_fd: std.posix.fd_t = drm.memToDmaBuf(va, mem.size) catch |e| {
+        // If the renderD node is not available on this box, skip gracefully.
+        if (e == error.DrmOpenFailed) return error.SkipZigTest;
+        return e;
+    };
+    // The dma-buf fd must be valid (>= 0).
+    try std.testing.expect(dmabuf_fd >= 0);
+
+    // Critical acceptance test: readlink /proc/self/fd/<fd> must contain "dmabuf".
+    // A real dma-buf shows something like "anon_inode:dmabuf" or "/dmabuf:...".
+    // A /dev/nvidiactl fd (the bug the prior attempt had) would show "/dev/nvidiactl".
+    var proc_path_buf: [64]u8 = undefined;
+    const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{dmabuf_fd}) catch unreachable;
+    var link_target: [256]u8 = undefined;
+    const link_len = std.os.linux.readlink(proc_path.ptr, &link_target, link_target.len);
+    try std.testing.expect(@as(isize, @bitCast(link_len)) > 0);
+    const target_str = link_target[0..link_len];
+
+    // Log the target so the test output shows the readlink value.
+    std.debug.print("\n[dmabuf test] readlink({s}) = {s}\n", .{ proc_path, target_str });
+
+    // The presence of "dmabuf" in the link target is the acceptance criterion.
+    const has_dmabuf = std.mem.indexOf(u8, target_str, "dmabuf") != null;
+    if (!has_dmabuf) {
+        std.debug.print("[dmabuf test] FAIL: target '{s}' does not contain 'dmabuf'\n", .{target_str});
+    }
+    try std.testing.expect(has_dmabuf);
+
+    // Close the dma-buf fd. The mapping defer runs after this at scope end,
+    // which is correct: mapping must outlive the dma-buf consumer (this test).
+    _ = std.os.linux.close(dmabuf_fd);
 }
 
 test "live: submit a command, the GPU executes it (semaphore release)" {

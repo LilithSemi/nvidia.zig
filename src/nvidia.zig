@@ -23,6 +23,13 @@ pub const gsp = @import("nvidia/gsp/gsp.zig");
 /// (Linux kernel-RM ioctls, or the freestanding RM-over-GSP path) - exposed so the
 /// UEFI app can assemble the freestanding Transport's metal bring-up (openOnMetal).
 pub const transport = @import("nvidia/transport.zig");
+/// nvidia-drm node helpers: GEM_IMPORT_USERSPACE_MEMORY + PRIME_HANDLE_TO_FD.
+/// Use memToDmaBuf(va, size) to turn a CPU mapping into a real dma-buf fd.
+pub const drm = @import("nvidia/drm.zig");
+
+/// Turn a CPU virtual address (from mapMemory on a .system allocation) into a
+/// real Linux dma-buf fd via the nvidia-drm render node.
+pub const memToDmaBuf = drm.memToDmaBuf;
 
 pub const Client = rm.Client;
 pub const Device = rm.Device;
