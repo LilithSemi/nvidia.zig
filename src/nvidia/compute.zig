@@ -614,3 +614,162 @@ test "live: every thread of a grid writes its own global index" {
         try std.testing.expectEqual(@as(u32, @intCast(i)), out.read(u32, i));
     }
 }
+
+test "live: a carry chain of two IADD3 makes a 64-bit add" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, 0xffffffff, .{});
+    a.movImm(3, 0, .{});
+    // R2:R3 += 1. The low add produces the carry, the high add consumes it.
+    a.iadd3Carry(2, sass.Src.reg(2), sass.Src.imm(1), sass.zero, 0, null, .{});
+    a.iadd3Carry(3, sass.Src.reg(3), sass.zero, sass.zero, sass.PT, 0, .{});
+    a.stg(0, 2, 0, .bits64, .{});
+    // A second step, this time with no carry out of the low half.
+    a.iadd3Carry(2, sass.Src.reg(2), sass.Src.imm(7), sass.zero, 0, null, .{});
+    a.iadd3Carry(3, sass.Src.reg(3), sass.zero, sass.zero, sass.PT, 0, .{});
+    a.stg(0, 2, 8, .bits64, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), out.read(u64, 0));
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0007), out.read(u64, 1));
+}
+
+/// Byte offsets of the matmul kernel's parameters inside constant bank 0.
+const mm_params = struct {
+    const a_ptr = 0;
+    const b_ptr = 8;
+    const c_ptr = 16;
+    const rows = 24; // M
+    const cols = 28; // N
+    const depth = 32; // K
+    const size = 36;
+};
+
+/// Assemble a naive single-precision matmul: C[M,N] = A[M,K] * B[K,N], all
+/// row-major. One thread computes one element of C, so the launch is a grid of
+/// `tile` by `tile` blocks covering C. K must be at least 1: the inner loop
+/// tests its counter at the bottom.
+///
+/// Registers: R0:R1 and R2:R3 walk A and B, R4 accumulates, R5 counts k,
+/// R6/R7 hold the loaded elements, R8/R9 are the row and column of this thread,
+/// R10..R13 hold M, N, K and the byte stride of a B row, R14:R15 addresses C,
+/// R16 is scratch, and R20..R25 hold the three base pointers.
+fn buildMatmul(a: *sass.Assembler, tile: u32) void {
+    const Src = sass.Src;
+    const zero = sass.zero;
+
+    // row = ctaid.y * tile + tid.y, col = ctaid.x * tile + tid.x
+    a.s2r(8, sass.SR_TID_Y, .{ .wr_barrier = 0 });
+    a.s2r(16, sass.SR_CTAID_Y, .{ .wr_barrier = 1 });
+    a.imad(8, Src.reg(16), Src.imm(tile), Src.reg(8), false, .{ .wait_mask = 0b11 });
+    a.s2r(9, sass.SR_TID_X, .{ .wr_barrier = 0 });
+    a.s2r(16, sass.SR_CTAID_X, .{ .wr_barrier = 1 });
+    a.imad(9, Src.reg(16), Src.imm(tile), Src.reg(9), false, .{ .wait_mask = 0b11 });
+
+    // Every parameter read is a separate scoreboard, so each use waits only on
+    // the value it needs.
+    a.ldc(10, .{ .offset = mm_params.rows }, sass.RZ, .bits32, .{ .wr_barrier = 0 });
+    a.ldc(11, .{ .offset = mm_params.cols }, sass.RZ, .bits32, .{ .wr_barrier = 1 });
+    a.ldc(12, .{ .offset = mm_params.depth }, sass.RZ, .bits32, .{ .wr_barrier = 2 });
+    a.ldc(20, .{ .offset = mm_params.a_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 3 });
+    a.ldc(22, .{ .offset = mm_params.b_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 4 });
+    a.ldc(24, .{ .offset = mm_params.c_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 5 });
+
+    // The grid is rounded up to whole tiles, so the threads past the edge of C
+    // leave without touching memory.
+    a.isetp(0, .ge, true, Src.reg(8), Src.reg(10), .{ .wait_mask = 0b000001 });
+    const row_outside = a.braForward(.{ .pred = 0 });
+    a.isetp(0, .ge, true, Src.reg(9), Src.reg(11), .{ .wait_mask = 0b000010 });
+    const col_outside = a.braForward(.{ .pred = 0 });
+
+    a.imad(16, Src.reg(8), Src.reg(12), zero, false, .{ .wait_mask = 0b000100 }); // row*K
+    a.imadWide(0, Src.reg(16), Src.imm(4), Src.reg(20), false, .{ .wait_mask = 0b001000 });
+    a.imadWide(2, Src.reg(9), Src.imm(4), Src.reg(22), false, .{ .wait_mask = 0b010000 });
+    a.imad(13, Src.reg(11), Src.imm(4), zero, false, .{}); // bytes per B row
+    a.movImm(4, 0, .{}); // accumulator = 0.0f
+    a.movImm(5, 0, .{}); // k = 0
+
+    // The loop walks A along its row and B down its column. Both loads set a
+    // write scoreboard for the multiply and a read scoreboard for the pointer
+    // step, so the step cannot outrun the address the load still needs.
+    const loop = a.here();
+    a.ldg(6, 0, 0, .bits32, .{ .wr_barrier = 0, .rd_barrier = 2 });
+    a.ldg(7, 2, 0, .bits32, .{ .wr_barrier = 1, .rd_barrier = 3 });
+    a.iadd3Carry(0, Src.reg(0), Src.imm(4), zero, 1, null, .{ .wait_mask = 0b001100 });
+    a.iadd3Carry(1, Src.reg(1), zero, zero, sass.PT, 1, .{});
+    a.iadd3Carry(2, Src.reg(2), Src.reg(13), zero, 1, null, .{});
+    a.iadd3Carry(3, Src.reg(3), zero, zero, sass.PT, 1, .{});
+    a.ffma(4, Src.reg(6), Src.reg(7), Src.reg(4), .{ .wait_mask = 0b000011 });
+    a.iadd3(5, Src.reg(5), Src.imm(1), zero, .{});
+    a.isetp(0, .lt, true, Src.reg(5), Src.reg(12), .{});
+    a.bra(loop, .{ .pred = 0 });
+
+    a.imad(16, Src.reg(8), Src.reg(11), Src.reg(9), false, .{}); // row*N + col
+    a.imadWide(14, Src.reg(16), Src.imm(4), Src.reg(24), false, .{ .wait_mask = 0b100000 });
+    a.stg(14, 4, 0, .bits32, .{});
+
+    a.patchBranch(row_outside, a.here());
+    a.patchBranch(col_outside, a.here());
+    a.exit(.{ .stall = 1 });
+}
+
+test "live: a naive FP32 matmul kernel matches a CPU reference" {
+    var r = try Runner.init();
+    defer r.deinit();
+
+    // Sizes that are not multiples of the tile, so the edge guards are exercised.
+    const rows = 37;
+    const cols = 29;
+    const depth = 23;
+    const tile = 16;
+
+    const a_buf = try r.alloc(.system, rows * depth * 4);
+    const b_buf = try r.alloc(.system, depth * cols * 4);
+    const c_buf = try r.alloc(.system, rows * cols * 4);
+    const params = try r.alloc(.system, mm_params.size);
+
+    // Small whole numbers keep every product and every partial sum exact in
+    // f32, so the comparison below can demand equality rather than a tolerance.
+    const av = a_buf.slice(f32);
+    for (0..rows * depth) |i| av[i] = @floatFromInt(@as(i32, @intCast(i % 7)) - 3);
+    const bv = b_buf.slice(f32);
+    for (0..depth * cols) |i| bv[i] = @floatFromInt(@as(i32, @intCast(i % 5)) - 2);
+
+    const p = params.slice(u32);
+    p[0] = @truncate(a_buf.va);
+    p[1] = @intCast(a_buf.va >> 32);
+    p[2] = @truncate(b_buf.va);
+    p[3] = @intCast(b_buf.va >> 32);
+    p[4] = @truncate(c_buf.va);
+    p[5] = @intCast(c_buf.va >> 32);
+    p[6] = rows;
+    p[7] = cols;
+    p[8] = depth;
+
+    var code: [1024]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    buildMatmul(&a, tile);
+
+    try r.run(code[0..a.dwords()], .{
+        .register_count = a.registerCount(),
+        .grid = .{ (cols + tile - 1) / tile, (rows + tile - 1) / tile, 1 },
+        .block = .{ tile, tile, 1 },
+        .cbuf0_va = params.va,
+        .cbuf0_size = mm_params.size,
+    });
+
+    for (0..rows) |i| {
+        for (0..cols) |j| {
+            var want: f32 = 0;
+            for (0..depth) |k| want += av[i * depth + k] * bv[k * cols + j];
+            try std.testing.expectEqual(want, c_buf.read(f32, i * cols + j));
+        }
+    }
+}

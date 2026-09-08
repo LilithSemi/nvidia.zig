@@ -311,14 +311,37 @@ pub const Assembler = struct {
     /// `Src.negated` to subtract. The hardware needs at least one of a and b
     /// unmodified.
     pub fn iadd3(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, ctl: Control) void {
+        self.iadd3Carry(dst, a, b, c, PT, null, ctl);
+    }
+
+    /// IADD3 with the carry chain exposed: `carry_out` is the predicate register
+    /// that receives the carry (PT discards it) and `carry_in` adds the carry
+    /// from an earlier add (null for none). A pair of these is a 64-bit add,
+    /// which is how a kernel steps a pointer through an array.
+    pub fn iadd3Carry(
+        self: *Assembler,
+        dst: u8,
+        a: Src,
+        b: Src,
+        c: Src,
+        carry_out: u8,
+        carry_in: ?u8,
+        ctl: Control,
+    ) void {
         std.debug.assert(!a.neg or !b.neg);
         const w = self.next();
         self.encodeAlu(w, 0x010, dst, a, b, c);
-        setBits(w, 87, 3, PT); // carry-in = false
-        setBits(w, 90, 1, 1);
+        if (carry_in) |p| {
+            setBits(w, 87, 3, p);
+            setBits(w, 90, 1, 0);
+            setBits(w, 74, 1, 1); // .X, the extended add that reads a carry
+        } else {
+            setBits(w, 87, 3, PT); // carry-in = false
+            setBits(w, 90, 1, 1);
+        }
         setBits(w, 77, 3, PT); // second carry-in = false
         setBits(w, 80, 1, 1);
-        setBits(w, 81, 3, PT); // no carry-out
+        setBits(w, 81, 3, carry_out);
         setBits(w, 84, 3, PT); // no second carry-out
         putControl(w, ctl);
     }
