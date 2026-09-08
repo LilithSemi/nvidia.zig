@@ -5,10 +5,9 @@
 //! this file assemble run on the SMs.
 //!
 //! Scheduling: each instruction carries a `Control` with a stall count (cycles
-//! before the next instruction) and optional scoreboard barriers. The default
-//! stall is conservative - enough to cover a back-to-back fixed-latency register
-//! dependency. Variable-latency ops (global loads, texture) need scoreboard
-//! barriers via `Control.wr_barrier`/`wait_mask`; a real scheduler is future work.
+//! before the next instruction) and optional scoreboard barriers. Write those by
+//! hand, or give the assembler a `Dep` buffer and call `schedule`, which derives
+//! them from the register traffic using the measured `Latency` table below.
 //!
 //! Uniform registers (UGPR) are encoded in 8 bits here, which is the Blackwell
 //! (sm >= 100) width. Volta..Ada use 6 bits and need a per-generation switch
@@ -164,22 +163,50 @@ fn putControl(inst: []u32, c: Control) void {
     setBits(inst, 116, 6, c.wait_mask);
 }
 
-/// Cycles the scheduler leaves between a fixed-latency instruction and a reader
-/// of its result. Measured on Blackwell: a back-to-back dependent pair reads a
-/// stale register at a stall of 3 and the right value at 4, and IADD3, IMAD,
-/// SHF, SEL, MOV, FADD, FMUL and FFMA all behave the same way. A kernel with the
-/// full instruction mix needs 5, so this carries one more cycle of margin.
-/// Replacing it with a per-instruction table is the next step for performance.
-pub const ALU_LATENCY: u8 = 6;
+/// Which functional pipe an instruction issues to. A reader on the pipe that
+/// produced a value sees it one cycle sooner than a reader on the other pipe,
+/// which is the whole of the fixed-latency model on this hardware.
+pub const Pipe = enum {
+    /// The integer pipe: IADD3, LOP3, SHF.
+    alu,
+    /// The multiply pipe: MOV, SEL, IMAD, IMAD.WIDE, ISETP, FADD, FMUL, FFMA.
+    fma,
+    /// Memory, control flow, and anything whose result a scoreboard covers.
+    /// These never pay the cross-pipe cycle.
+    other,
+};
 
-/// The same for a predicate result read by another instruction. Measured with an
-/// ISETP feeding a SEL: correct from a stall of 5.
-pub const PRED_LATENCY: u8 = 5;
+/// Result latencies in cycles, measured on Blackwell by the probes in
+/// compute.zig. `Assembler.schedule` leaves this many cycles between an
+/// instruction and a reader of its result. The live test
+/// "the scheduler's latency table still covers the silicon" re-measures every
+/// figure here, so a chip that needs longer fails loudly instead of quietly
+/// computing the wrong answer.
+pub const Latency = struct {
+    /// A fixed-latency result read on the pipe that produced it.
+    pub const same_pipe: u8 = 4;
+    /// The same result read on the other compute pipe. Measured across every
+    /// pair of ALU and FMA instructions this encoder emits.
+    pub const cross_pipe: u8 = 5;
+    /// A predicate read as an instruction operand: a SEL condition, or the
+    /// carry-in of an extended IADD3.
+    pub const pred: u8 = 5;
+    /// A predicate read as a guard, or as a branch condition. The hardware tests
+    /// those far later in the pipeline, so they cost much more than an operand
+    /// read of the same predicate.
+    pub const pred_guard: u8 = 13;
 
-/// A branch reads its condition much later in the pipeline than an ALU reads a
-/// predicate. Measured with an ISETP feeding a BRA: the branch takes the stale
-/// predicate up to a stall of 12 and the new one from 13.
-pub const BRANCH_PRED_LATENCY: u8 = 13;
+    /// Cycles the scheduler adds on top of every measured figure above.
+    ///
+    /// The figures are measured with one dependency at a time. A whole kernel
+    /// adds effects this model does not carry, register bank conflicts among
+    /// them, and a tiled matmul run while the desktop is also using the GPU
+    /// fails about one run in ten with no margin and none in ten with it. Model
+    /// those effects and this can go to zero; until then a dependent reader
+    /// waits one cycle longer than the hardware strictly needs. Instructions
+    /// that depend on nothing are unaffected: they still issue back to back.
+    pub const margin: u8 = 1;
+};
 
 /// The number of scoreboards the hardware gives each warp.
 pub const BARRIERS: u8 = 6;
@@ -209,6 +236,10 @@ pub const Dep = struct {
     branch: bool = false,
     /// Control can arrive here from elsewhere.
     target: bool = false,
+    /// The pipe this instruction issues to, which sets how long a reader of its
+    /// result has to wait. Ignored when `variable` is set, because a scoreboard
+    /// covers those instead.
+    pipe: Pipe = .other,
 
     /// Fills a `Dep` one operand at a time, so an emitter can describe itself
     /// without counting array slots.
@@ -304,10 +335,13 @@ pub const Assembler = struct {
     pub fn here(self: *const Assembler) usize {
         return self.n / 4;
     }
-    /// A safe register count for the QMD: highest GPR used + 1, rounded up to the
-    /// hardware allocation granularity (multiples of 8, minimum 16).
+    /// A safe register count for the QMD. The hardware keeps the top two GPRs of
+    /// each thread's allocation for itself: writes to them are dropped and reads
+    /// return zero, verified live. So the count covers the highest GPR used plus
+    /// those two, rounded up to the allocation granularity of 8, minimum 16.
+    pub const RESERVED_GPRS: u32 = 2;
     pub fn registerCount(self: *const Assembler) u32 {
-        const used = @as(u32, self.max_reg) + 1;
+        const used = @as(u32, self.max_reg) + 1 + RESERVED_GPRS;
         return @max(16, (used + 7) & ~@as(u32, 7));
     }
 
@@ -330,9 +364,10 @@ pub const Assembler = struct {
         const count = self.n / 4;
         if (count == 0) return;
 
-        var reg_ready = [_]u32{0} ** 256; // cycle a GPR becomes readable
+        var reg_ready = [_]u32{0} ** 256; // cycle a same-pipe reader can use a GPR
+        var reg_pipe = [_]Pipe{.other} ** 256; // the pipe that wrote it
         var pred_ready = [_]u32{0} ** 8; // when an ALU can read a predicate
-        var pred_ready_branch = [_]u32{0} ** 8; // when a branch can read it
+        var pred_ready_guard = [_]u32{0} ** 8; // when a guard or branch can read it
         var wr_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending write
         var rd_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending read
         var bar_used = [_]bool{false} ** BARRIERS;
@@ -357,7 +392,7 @@ pub const Assembler = struct {
             }
             for (d.reads) |r| {
                 if (r == RZ) continue;
-                need = @max(need, reg_ready[r]);
+                need = @max(need, reg_ready[r] + crossPipeCost(reg_pipe[r], d.pipe));
                 if (wr_bar[r] != NO_BARRIER) wait |= @as(u6, 1) << @intCast(wr_bar[r]);
             }
             for (d.writes) |w| {
@@ -367,9 +402,13 @@ pub const Assembler = struct {
                 if (rd_bar[w] != NO_BARRIER) wait |= @as(u6, 1) << @intCast(rd_bar[w]);
             }
             if (d.pred_read != PT) {
-                const ready = if (d.branch) pred_ready_branch[d.pred_read] else pred_ready[d.pred_read];
+                const ready = if (d.branch) pred_ready_guard[d.pred_read] else pred_ready[d.pred_read];
                 need = @max(need, ready);
             }
+            // The guard predicate lives in the encoded instruction, not in the
+            // dependency record, so read it back out.
+            const guard = self.instrPred(i);
+            if (guard != PT) need = @max(need, pred_ready_guard[guard]);
             if (d.pred_write != PT) need = @max(need, pred_ready[d.pred_write]);
 
             // Space the previous instruction so this one issues no earlier than
@@ -392,13 +431,15 @@ pub const Assembler = struct {
                     if (w == RZ) continue;
                     wr_bar[w] = b;
                     reg_ready[w] = cycle;
+                    reg_pipe[w] = .other;
                 }
             } else {
-                const latency: u32 = if (d.variable) 0 else ALU_LATENCY;
+                const wait_cycles: u32 = if (d.variable) 0 else Latency.same_pipe + Latency.margin;
                 for (d.writes) |w| {
                     if (w == RZ) continue;
                     wr_bar[w] = NO_BARRIER;
-                    reg_ready[w] = cycle + latency;
+                    reg_ready[w] = cycle + wait_cycles;
+                    reg_pipe[w] = if (d.variable) .other else d.pipe;
                 }
             }
             if (d.late_read and self.writesAnyLater(i, d.reads)) {
@@ -410,8 +451,8 @@ pub const Assembler = struct {
                 }
             }
             if (d.pred_write != PT) {
-                pred_ready[d.pred_write] = cycle + PRED_LATENCY;
-                pred_ready_branch[d.pred_write] = cycle + BRANCH_PRED_LATENCY;
+                pred_ready[d.pred_write] = cycle + Latency.pred + Latency.margin;
+                pred_ready_guard[d.pred_write] = cycle + Latency.pred_guard + Latency.margin;
             }
 
             ctl.wait_mask = wait;
@@ -423,13 +464,15 @@ pub const Assembler = struct {
                 // Give the branch a stall long enough that every fixed-latency
                 // result in flight has landed wherever control goes next.
                 var pending: u32 = 0;
-                for (reg_ready) |t| pending = @max(pending, t -| cycle);
+                // Add the cross-pipe cycle: whatever runs next may be on the
+                // other pipe from whatever is still in flight.
+                for (reg_ready) |t| pending = @max(pending, (t + 1) -| cycle);
                 for (pred_ready) |t| pending = @max(pending, t -| cycle);
-                for (pred_ready_branch) |t| pending = @max(pending, t -| cycle);
+                for (pred_ready_guard) |t| pending = @max(pending, t -| cycle);
                 self.setStall(i, @intCast(@max(1, @min(15, pending))));
                 @memset(&reg_ready, 0);
                 @memset(&pred_ready, 0);
-                @memset(&pred_ready_branch, 0);
+                @memset(&pred_ready_guard, 0);
                 have_prev = false;
                 cycle = 0;
                 prev_issue = 0;
@@ -442,6 +485,14 @@ pub const Assembler = struct {
         }
         // The last instruction has nothing after it to space out.
         if (have_prev) self.setStall(prev, 1);
+    }
+
+    /// The extra cycle a reader pays when the value came off the other compute
+    /// pipe. Memory and scoreboard-covered results never pay it.
+    fn crossPipeCost(writer: Pipe, reader: Pipe) u32 {
+        if (writer == .other or reader == .other) return 0;
+        if (writer == reader) return 0;
+        return Latency.cross_pipe - Latency.same_pipe;
     }
 
     fn releaseBarriers(wait: u6, used: *[BARRIERS]bool, wr: *[256]u8, rd: *[256]u8) void {
@@ -481,6 +532,8 @@ pub const Assembler = struct {
     /// still reading them. Control flow makes the answer unknowable, so a branch
     /// or a branch target ends the scan with a yes.
     fn writesAnyLater(self: *const Assembler, i: usize, regs: [6]u8) bool {
+        // Nothing to guard when the instruction reads no register at all.
+        if (regs[0] == RZ) return false;
         var j = i + 1;
         while (j < self.n / 4) : (j += 1) {
             const d = self.deps[j];
@@ -583,6 +636,7 @@ pub const Assembler = struct {
         self.encodeAlu(w, 0x002, dst, null, src, null);
         setBits(w, 72, 4, 0xf); // all quad lanes
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(src);
         self.dep(dp);
@@ -607,6 +661,7 @@ pub const Assembler = struct {
         setBits(w, 87, 3, pred);
         setBits(w, 90, 1, @intFromBool(pred_not));
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -657,6 +712,7 @@ pub const Assembler = struct {
         setBits(w, 81, 3, carry_out);
         setBits(w, 84, 3, PT); // no second carry-out
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -679,6 +735,7 @@ pub const Assembler = struct {
         setBits(w, 81, 3, PT); // no predicate destination
         setBits(w, 73, 1, @intFromBool(signed));
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -703,6 +760,7 @@ pub const Assembler = struct {
         setBits(w, 81, 3, PT);
         setBits(w, 73, 1, @intFromBool(signed));
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.writeRun(dst, 2);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -724,6 +782,7 @@ pub const Assembler = struct {
         setBits(w, 87, 3, PT); // predicate input = false
         setBits(w, 90, 1, 1);
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -742,6 +801,7 @@ pub const Assembler = struct {
         setBits(w, 76, 1, 0); // left
         setBits(w, 80, 1, 0); // take the low half of the funnel
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(shift);
@@ -759,6 +819,7 @@ pub const Assembler = struct {
         setBits(w, 76, 1, 1); // right
         setBits(w, 80, 1, 1); // take the high half of the funnel
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(shift);
@@ -781,6 +842,7 @@ pub const Assembler = struct {
         setBits(w, 81, 3, dst);
         setBits(w, 84, 3, PT); // no second destination
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.dep.pred_write = dst;
         dp.readSrc(a);
         dp.readSrc(b);
@@ -806,6 +868,7 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // round to nearest even
         setBits(w, 80, 1, 0); // no flush-to-zero
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -823,6 +886,7 @@ pub const Assembler = struct {
         setBits(w, 80, 1, 0); // no flush-to-zero
         setBits(w, 84, 3, 4); // no post-multiply divide
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -840,6 +904,7 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // round to nearest even
         setBits(w, 80, 1, 0); // no flush-to-zero
         var dp = Dep.Builder{};
+        dp.dep.pipe = .fma;
         dp.write(dst);
         dp.readSrc(a);
         dp.readSrc(b);
@@ -879,6 +944,7 @@ pub const Assembler = struct {
         setBits(w, 81, 3, PT); // no predicate destination
         putGlobalAccess(w, mem_type, offset);
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.writeRun(dst, mem_type.regs());
         dp.readRun(addr, 2);
         dp.dep.variable = true;
@@ -901,6 +967,7 @@ pub const Assembler = struct {
         setBits(w, 72, 1, 1); // ... and it counts as 64-bit
         putGlobalAccess(w, mem_type, offset);
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.readRun(addr, 2);
         dp.readRun(data, mem_type.regs());
         dp.dep.late_read = true;
@@ -930,6 +997,7 @@ pub const Assembler = struct {
         setBits(w, 87, 1, 0); // no predicate result
         setBits(w, 91, 1, 1);
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.writeRun(dst, mem_type.regs());
         dp.read(addr);
         dp.dep.variable = true;
@@ -953,6 +1021,7 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // address stride x1
         setBits(w, 91, 1, 1);
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.read(addr);
         dp.readRun(data, mem_type.regs());
         dp.dep.late_read = true;
@@ -978,6 +1047,7 @@ pub const Assembler = struct {
         setBits(w, 80, 2, 0); // no texture-header unpack (sm >= 120)
         setBits(w, 91, 1, 0); // bound bank, not a bindless handle
         var dp = Dep.Builder{};
+        dp.dep.pipe = .alu;
         dp.writeRun(dst, mem_type.regs());
         dp.read(index);
         dp.dep.variable = true;
@@ -1331,8 +1401,9 @@ test "schedule packs independent instructions and spaces dependent ones" {
 
     // The second move depends on nothing, so it issues on the next cycle.
     try std.testing.expectEqual(@as(u32, 1), stallOf(&code, 0));
-    // R1 is written at cycle 1 and readable at cycle 5, so the add waits.
-    try std.testing.expectEqual(@as(u32, ALU_LATENCY), stallOf(&code, 1));
+    // MOV writes on the multiply pipe and IADD3 reads on the integer pipe, so
+    // the add pays the cross-pipe cycle on top of the base latency.
+    try std.testing.expectEqual(@as(u32, Latency.cross_pipe + Latency.margin), stallOf(&code, 1));
     // Nothing needs a scoreboard: every result here has a fixed latency.
     try std.testing.expectEqual(@as(u32, 7), wrBarrierOf(&code, 0));
     try std.testing.expectEqual(@as(u32, 0), waitMaskOf(&code, 2));
@@ -1391,5 +1462,5 @@ test "schedule drains every scoreboard at a branch" {
     try std.testing.expectEqual(@as(u32, 0b1), waitMaskOf(&code, 3));
     try std.testing.expect(deps[loop].target);
     // The branch covers the predicate the compare produced.
-    try std.testing.expect(stallOf(&code, 3) >= PRED_LATENCY);
+    try std.testing.expect(stallOf(&code, 3) >= Latency.pred);
 }

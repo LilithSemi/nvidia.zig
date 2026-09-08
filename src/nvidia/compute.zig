@@ -1045,3 +1045,624 @@ test "live: a Runner reuses its channel for different kernels" {
         try std.testing.expectEqual(@as(u32, n), out.read(u32, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Instruction latency probes. Each probe writes a known value with one
+// instruction and reads it back with the next, so a stall that is too short
+// shows up as the value the destination held before. `measureLatency` searches
+// for the smallest stall that reads the new value, which is the result latency
+// the scheduler has to leave. The table in sass.zig comes from these numbers,
+// and the test at the end asserts the table still covers the silicon.
+// ---------------------------------------------------------------------------
+
+const probe_good: u32 = 0x1234;
+const probe_stale: u32 = 0x9999;
+const probe_stale_hi: u32 = 0x8888;
+const probe_float_bits: u32 = 0x40000000; // 2.0f
+
+/// The producer-to-consumer pairs the harness times.
+const Probe = enum {
+    mov_to_alu,
+    iadd3_to_alu,
+    imad_to_alu,
+    lop3_to_alu,
+    shf_to_alu,
+    sel_to_alu,
+    fadd_to_alu,
+    fmul_to_alu,
+    ffma_to_alu,
+    imadwide_lo_to_alu,
+    imadwide_hi_to_alu,
+    imadwide_to_ldg_address,
+    imadwide_hi_to_imad,
+    imadwide_hi_to_stg_data,
+    imad_to_imadwide,
+    sel_to_imad,
+    iadd3_to_lds_address,
+    iadd3_to_sts_address,
+    sel_to_sts_data,
+    iadd3_to_stg_data,
+    ffma_to_stg_data,
+    iadd3_to_isetp,
+    iadd3_to_imad,
+    iadd3_to_sel,
+    iadd3_to_mov,
+    iadd3_to_shf,
+    iadd3_to_lop3,
+    ffma_to_ffma,
+    mov_to_imad,
+    imad_to_mov,
+    sel_to_isetp,
+    shf_to_lop3,
+    isetp_to_sel,
+    isetp_to_guard,
+    isetp_to_branch,
+
+    fn expected(self: Probe) u32 {
+        return switch (self) {
+            .imadwide_hi_to_alu, .imadwide_hi_to_imad, .imadwide_hi_to_stg_data => 0,
+            .fadd_to_alu, .fmul_to_alu, .ffma_to_alu, .ffma_to_stg_data, .ffma_to_ffma => probe_float_bits,
+            else => probe_good,
+        };
+    }
+
+    /// Shared memory the probe needs, in bytes.
+    fn sharedBytes(self: Probe) u32 {
+        return switch (self) {
+            .iadd3_to_lds_address, .iadd3_to_sts_address, .sel_to_sts_data => 256,
+            else => 0,
+        };
+    }
+};
+
+/// Every thread runs the same probe and stores its own answer, so the timing is
+/// measured at the occupancy a real kernel runs at rather than with one warp.
+const probe_threads = 256;
+
+fn buildProbe(a: *sass.Assembler, p: Probe, stall: u4, out_va: u64, in_va: u64) void {
+    const Src = sass.Src;
+    const zero = sass.zero;
+    const st = sass.Control{ .stall = stall };
+    a.movImm(22, @truncate(out_va), .{});
+    a.movImm(23, @intCast(out_va >> 32), .{});
+    a.s2r(24, sass.SR_TID_X, .{ .wr_barrier = 5 });
+    a.imadWide(20, Src.reg(24), Src.imm(4), Src.reg(22), false, .{ .wait_mask = 0b100000 });
+
+    switch (p) {
+        .mov_to_alu, .iadd3_to_alu, .imad_to_alu, .lop3_to_alu, .shf_to_alu, .sel_to_alu => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.movImm(5, 7, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), .{}); // P0 true, for SEL
+            switch (p) {
+                .mov_to_alu => a.movReg(3, 2, st),
+                .iadd3_to_alu => a.iadd3(3, Src.reg(2), Src.imm(0), zero, st),
+                .imad_to_alu => a.imad(3, Src.reg(2), Src.imm(1), zero, false, st),
+                .lop3_to_alu => a.lop3(3, Src.reg(2), zero, zero, 0xf0, st), // dst = a
+                .shf_to_alu => a.shl(3, Src.reg(2), Src.imm(0), st),
+                .sel_to_alu => a.sel(3, Src.reg(2), zero, 0, false, st),
+                else => unreachable,
+            }
+            a.iadd3(4, Src.reg(3), Src.imm(0), zero, .{});
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .fadd_to_alu, .fmul_to_alu, .ffma_to_alu => {
+            a.mov(2, Src.float(2.0), .{});
+            a.mov(10, Src.float(0.0), .{});
+            a.mov(11, Src.float(1.0), .{});
+            a.mov(3, Src.float(9.0), .{}); // the stale value
+            switch (p) {
+                .fadd_to_alu => a.fadd(3, Src.reg(2), Src.reg(10), st),
+                .fmul_to_alu => a.fmul(3, Src.reg(2), Src.reg(11), st),
+                .ffma_to_alu => a.ffma(3, Src.reg(2), Src.reg(11), Src.reg(10), st),
+                else => unreachable,
+            }
+            a.fadd(4, Src.reg(3), Src.reg(10), .{});
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .imadwide_lo_to_alu, .imadwide_hi_to_alu => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(6, probe_stale, .{});
+            a.movImm(7, probe_stale_hi, .{});
+            a.imadWide(6, Src.reg(2), Src.imm(1), zero, false, st);
+            const half: u8 = if (p == .imadwide_lo_to_alu) 6 else 7;
+            a.iadd3(4, Src.reg(half), Src.imm(0), zero, .{});
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .imadwide_hi_to_imad, .imadwide_hi_to_stg_data => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(6, probe_stale, .{});
+            a.movImm(7, probe_stale_hi, .{});
+            a.imadWide(6, Src.reg(2), Src.imm(1), zero, false, st);
+            if (p == .imadwide_hi_to_imad) {
+                a.imad(4, Src.reg(7), Src.imm(1), zero, false, .{});
+                a.stg(20, 4, 0, .bits32, .{});
+            } else {
+                a.stg(20, 7, 0, .bits32, .{});
+            }
+        },
+        .imad_to_imadwide => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.imad(3, Src.reg(2), Src.imm(1), zero, false, st);
+            a.imadWide(6, Src.reg(3), Src.imm(1), zero, false, .{});
+            a.stg(20, 6, 0, .bits32, .{});
+        },
+        .sel_to_imad => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.movImm(5, 7, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), .{});
+            a.sel(3, Src.reg(2), zero, 0, false, st);
+            a.imad(4, Src.reg(3), Src.imm(1), zero, false, .{});
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .imadwide_to_ldg_address => {
+            // A stale address reads the decoy 64 bytes in, not the real element.
+            a.movImm(6, @truncate(in_va + 64), .{});
+            a.movImm(7, @intCast((in_va + 64) >> 32), .{});
+            a.movImm(4, @truncate(in_va), .{});
+            a.movImm(5, @intCast(in_va >> 32), .{});
+            a.movImm(2, 0, .{});
+            a.imadWide(6, Src.reg(2), Src.imm(1), Src.reg(4), false, st);
+            a.ldg(8, 6, 0, .bits32, .{ .wr_barrier = 0 });
+            a.stg(20, 8, 0, .bits32, .{ .wait_mask = 0b1 });
+        },
+        .iadd3_to_lds_address => {
+            a.movImm(8, 0, .{});
+            a.movImm(9, probe_good, .{});
+            a.sts(8, 9, 0, .bits32, .{});
+            a.movImm(10, probe_stale, .{});
+            a.sts(8, 10, 64, .bits32, .{});
+            a.bar(.{});
+            a.movImm(11, 64, .{});
+            a.iadd3(11, Src.reg(11), Src.imm(@bitCast(@as(i32, -64))), zero, st);
+            a.lds(12, 11, 0, .bits32, .{ .wr_barrier = 0 });
+            a.stg(20, 12, 0, .bits32, .{ .wait_mask = 0b1 });
+        },
+        .iadd3_to_sts_address => {
+            a.movImm(8, 0, .{});
+            a.movImm(13, probe_stale, .{});
+            a.sts(8, 13, 0, .bits32, .{}); // shared[0] starts wrong
+            a.bar(.{});
+            a.movImm(9, probe_good, .{});
+            a.movImm(11, 64, .{});
+            a.iadd3(11, Src.reg(11), Src.imm(@bitCast(@as(i32, -64))), zero, st);
+            a.sts(11, 9, 0, .bits32, .{}); // a stale address stores 64 bytes in
+            a.bar(.{});
+            a.lds(12, 8, 0, .bits32, .{ .wr_barrier = 0 });
+            a.stg(20, 12, 0, .bits32, .{ .wait_mask = 0b1 });
+        },
+        .sel_to_sts_data => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.movImm(5, 7, .{});
+            a.movImm(8, 0, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), .{});
+            a.sel(3, Src.reg(2), zero, 0, false, st);
+            a.sts(8, 3, 0, .bits32, .{});
+            a.bar(.{});
+            a.lds(12, 8, 0, .bits32, .{ .wr_barrier = 0 });
+            a.stg(20, 12, 0, .bits32, .{ .wait_mask = 0b1 });
+        },
+        .iadd3_to_stg_data => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.iadd3(3, Src.reg(2), Src.imm(0), zero, st);
+            a.stg(20, 3, 0, .bits32, .{});
+        },
+        .ffma_to_stg_data => {
+            a.mov(2, Src.float(2.0), .{});
+            a.mov(10, Src.float(0.0), .{});
+            a.mov(11, Src.float(1.0), .{});
+            a.mov(3, Src.float(9.0), .{});
+            a.ffma(3, Src.reg(2), Src.reg(11), Src.reg(10), st);
+            a.stg(20, 3, 0, .bits32, .{});
+        },
+        .iadd3_to_isetp, .iadd3_to_imad, .iadd3_to_sel, .iadd3_to_mov, .iadd3_to_shf, .iadd3_to_lop3 => {
+            // One producer, six different consumers of its result.
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.movImm(4, 0, .{});
+            a.movImm(5, 7, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), .{}); // P0 true, for SEL
+            a.iadd3(3, Src.reg(2), Src.imm(0), zero, st);
+            switch (p) {
+                .iadd3_to_isetp => {
+                    a.isetp(1, .eq, true, Src.reg(3), Src.imm(probe_good), .{});
+                    a.sel(4, Src.reg(2), zero, 1, false, .{});
+                },
+                .iadd3_to_imad => a.imad(4, Src.reg(3), Src.imm(1), zero, false, .{}),
+                .iadd3_to_sel => a.sel(4, Src.reg(3), zero, 0, false, .{}),
+                .iadd3_to_mov => a.movReg(4, 3, .{}),
+                .iadd3_to_shf => a.shl(4, Src.reg(3), Src.imm(0), .{}),
+                .iadd3_to_lop3 => a.lop3(4, Src.reg(3), zero, zero, 0xf0, .{}),
+                else => unreachable,
+            }
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .mov_to_imad, .imad_to_mov, .sel_to_isetp, .shf_to_lop3 => {
+            // Pairs the pipe model says are same-pipe, so 4 cycles should do.
+            a.movImm(2, probe_good, .{});
+            a.movImm(3, probe_stale, .{});
+            a.movImm(4, 0, .{});
+            a.movImm(5, 7, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), .{});
+            switch (p) {
+                .mov_to_imad => {
+                    a.movReg(3, 2, st);
+                    a.imad(4, Src.reg(3), Src.imm(1), zero, false, .{});
+                },
+                .imad_to_mov => {
+                    a.imad(3, Src.reg(2), Src.imm(1), zero, false, st);
+                    a.movReg(4, 3, .{});
+                },
+                .sel_to_isetp => {
+                    a.sel(3, Src.reg(2), zero, 0, false, st);
+                    a.isetp(1, .eq, true, Src.reg(3), Src.imm(probe_good), .{});
+                    a.sel(4, Src.reg(2), zero, 1, false, .{});
+                },
+                .shf_to_lop3 => {
+                    a.shl(3, Src.reg(2), Src.imm(0), st);
+                    a.lop3(4, Src.reg(3), zero, zero, 0xf0, .{});
+                },
+                else => unreachable,
+            }
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .ffma_to_ffma => {
+            a.mov(2, Src.float(2.0), .{});
+            a.mov(10, Src.float(0.0), .{});
+            a.mov(11, Src.float(1.0), .{});
+            a.mov(3, Src.float(9.0), .{});
+            a.ffma(3, Src.reg(2), Src.reg(11), Src.reg(10), st);
+            a.ffma(4, Src.reg(3), Src.reg(11), Src.reg(10), .{});
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .isetp_to_sel, .isetp_to_guard => {
+            a.movImm(2, probe_good, .{});
+            a.movImm(4, 0, .{});
+            a.movImm(5, 7, .{});
+            a.isetp(0, .ne, true, Src.reg(5), Src.imm(7), .{}); // P0 false
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(7), st); // P0 true
+            if (p == .isetp_to_sel) {
+                a.sel(4, Src.reg(2), zero, 0, false, .{});
+            } else {
+                a.movReg(4, 2, .{ .pred = 0 });
+            }
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+        .isetp_to_branch => {
+            a.movImm(4, 0, .{});
+            a.movImm(5, 1, .{});
+            a.isetp(0, .eq, true, Src.reg(5), Src.imm(1), .{}); // P0 true
+            a.isetp(0, .ne, true, Src.reg(5), Src.imm(1), st); // P0 false
+            const skip = a.braForward(.{ .pred = 0 }); // must fall through
+            a.movImm(4, probe_good, .{});
+            a.patchBranch(skip, a.here());
+            a.stg(20, 4, 0, .bits32, .{});
+        },
+    }
+    a.exit(.{ .stall = 1 });
+}
+
+fn runProbe(r: *Runner, p: Probe, stall: u4, out: Buffer, in: Buffer) !bool {
+    var code: [512]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    buildProbe(&a, p, stall, out.va, in.va);
+    @memset(out.slice(u32)[0..probe_threads], 0);
+    try r.run(code[0..a.dwords()], .{
+        .register_count = a.registerCount(),
+        .block = .{ probe_threads, 1, 1 },
+        .shared_mem_bytes = @max(p.sharedBytes(), 256),
+    });
+    // One thread reading a stale value is a failure for the whole probe.
+    for (0..probe_threads) |i| {
+        if (out.read(u32, i) != p.expected()) return false;
+    }
+    return true;
+}
+
+/// The smallest stall at which `p` reads the new value. A longer stall always
+/// works, so the search halves the range each step.
+fn measureLatency(r: *Runner, p: Probe, out: Buffer, in: Buffer) !u4 {
+    if (!try runProbe(r, p, 15, out, in)) return error.ProbeNeverSettles;
+    var lo: u4 = 1;
+    var hi: u4 = 15;
+    while (lo < hi) {
+        const mid: u4 = lo + (hi - lo) / 2;
+        if (try runProbe(r, p, mid, out, in)) hi = mid else lo = mid + 1;
+    }
+    return lo;
+}
+
+test "live: the scheduler's latency table still covers the silicon" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const in = try r.alloc(.system, 0x1000);
+    in.slice(u32)[0] = probe_good;
+    in.slice(u32)[16] = probe_stale;
+
+    var short = false;
+    for (std.enums.values(Probe)) |p| {
+        const measured = try measureLatency(&r, p, out, in);
+        // The pipe model: a value read on the pipe that produced it costs
+        // `same_pipe`, one read on the other compute pipe costs `cross_pipe`,
+        // and a predicate costs more again when a guard or a branch reads it.
+        const budget: u8 = switch (p) {
+            .mov_to_alu,
+            .imad_to_alu,
+            .sel_to_alu,
+            .imadwide_lo_to_alu,
+            .imadwide_hi_to_alu,
+            .iadd3_to_isetp,
+            .iadd3_to_imad,
+            .iadd3_to_sel,
+            .iadd3_to_mov,
+            => sass.Latency.cross_pipe,
+            .isetp_to_sel => sass.Latency.pred,
+            .isetp_to_guard, .isetp_to_branch => sass.Latency.pred_guard,
+            else => sass.Latency.same_pipe,
+        };
+        if (@as(u8, measured) > budget) {
+            std.debug.print("probe {t} = {d} (table allows {d})\n", .{ p, measured, budget });
+            short = true;
+        }
+    }
+    if (short) return error.LatencyTableTooShort;
+}
+
+test "live: BAR.SYNC synchronises every warp of a block" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const threads = 256; // eight warps, so a barrier that only arrives shows up
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.s2r(2, sass.SR_TID_X, .{ .wr_barrier = 0 });
+    a.imad(3, sass.Src.reg(2), sass.Src.imm(4), sass.zero, false, .{ .wait_mask = 0b01 });
+    a.sts(3, 2, 0, .bits32, .{});
+    a.bar(.{});
+    a.movImm(7, threads - 1, .{});
+    a.imad(4, sass.Src.reg(2), sass.Src.imm(0xffffffff), sass.Src.reg(7), true, .{});
+    a.imad(5, sass.Src.reg(4), sass.Src.imm(4), sass.zero, false, .{});
+    a.lds(6, 5, 0, .bits32, .{ .wr_barrier = 0 });
+    a.movImm(8, @truncate(out.va), .{});
+    a.movImm(9, @intCast(out.va >> 32), .{});
+    a.imadWide(0, sass.Src.reg(2), sass.Src.imm(4), sass.Src.reg(8), false, .{});
+    a.stg(0, 6, 0, .bits32, .{ .wait_mask = 0b01 });
+    a.exit(.{ .stall = 1 });
+
+    // Run it a few times: a barrier that does not block fails intermittently.
+    for (0..8) |_| {
+        @memset(out.slice(u32)[0..threads], 0xff);
+        try r.run(code[0..a.dwords()], .{
+            .register_count = a.registerCount(),
+            .block = .{ threads, 1, 1 },
+            .shared_mem_bytes = threads * 4,
+        });
+        for (0..threads) |i| {
+            try std.testing.expectEqual(@as(u32, threads - 1 - @as(u32, @intCast(i))), out.read(u32, i));
+        }
+    }
+}
+
+test "live: a scheduled shared-memory dot product loop matches its reference" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const Src = sass.Src;
+    const steps = 16;
+    const threads = 256;
+
+    var code: [512]u32 = undefined;
+    var deps: [128]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    // Fill shared memory: slot i holds i + 1 as a float, in both halves.
+    a.s2r(2, sass.SR_TID_X, .{});
+    a.imad(3, Src.reg(2), Src.imm(4), sass.zero, false, .{});
+    // Slot i holds 1.0 for an even i and 2.0 for an odd one, so a pointer step
+    // that lands wrong changes the answer.
+    a.lop3(5, Src.reg(2), Src.imm(1), sass.zero, 0xc0, .{});
+    a.isetp(0, .eq, true, Src.reg(5), Src.imm(0), .{});
+    a.mov(6, Src.float(1.0), .{});
+    a.mov(7, Src.float(2.0), .{});
+    a.sel(4, Src.reg(6), Src.reg(7), 0, false, .{});
+    a.sts(3, 4, 0, .bits32, .{});
+    a.bar(.{});
+    // The loop under test: two shared loads, two pointer steps, one multiply-add.
+    a.movImm(30, 0, .{});
+    a.movImm(31, 0, .{});
+    a.movImm(26, 0, .{});
+    a.mov(20, Src.float(0.0), .{});
+    const loop = a.here();
+    a.lds(10, 30, 0, .bits32, .{});
+    a.lds(11, 31, 0, .bits32, .{});
+    a.iadd3(30, Src.reg(30), Src.imm(4), sass.zero, .{});
+    a.iadd3(31, Src.reg(31), Src.imm(4), sass.zero, .{});
+    a.ffma(20, Src.reg(10), Src.reg(11), Src.reg(20), .{});
+    a.iadd3(26, Src.reg(26), Src.imm(1), sass.zero, .{});
+    a.isetp(0, .lt, true, Src.reg(26), Src.imm(steps), .{});
+    a.bra(loop, .{ .pred = 0 });
+    a.movImm(6, @truncate(out.va), .{});
+    a.movImm(7, @intCast(out.va >> 32), .{});
+    a.imadWide(0, Src.reg(2), Src.imm(4), Src.reg(6), false, .{});
+    a.stg(0, 20, 0, .bits32, .{});
+    a.exit(.{});
+    try a.schedule();
+
+    var want: f32 = 0;
+    for (0..steps) |i| {
+        const v: f32 = if (i % 2 == 0) 1.0 else 2.0;
+        want += v * v;
+    }
+    for (0..8) |_| {
+        @memset(out.slice(u32)[0..threads], 0);
+        try r.run(code[0..a.dwords()], .{
+            .register_count = a.registerCount(),
+            .block = .{ threads, 1, 1 },
+            .shared_mem_bytes = threads * 4,
+        });
+        for (0..threads) |i| try std.testing.expectEqual(want, out.read(f32, i));
+    }
+}
+
+test "live: LOP3 applies its truth table to the three operands in order" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const Src = sass.Src;
+
+    var code: [512]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, 0xf0f0f0f0, .{});
+    a.movImm(3, 0xcccccccc, .{});
+    a.movImm(4, 0xaaaaaaaa, .{});
+    const luts = [_]u8{ 0xc0, 0x88, 0xa0, 0xf0, 0xcc, 0xaa, 0xfc, 0x3c };
+    for (luts, 0..) |lut, i| {
+        a.lop3(10, Src.reg(2), Src.reg(3), Src.reg(4), lut, .{});
+        a.stg(0, 10, @intCast(i * 4), .bits32, .{});
+    }
+    // The same with an immediate in the second operand slot.
+    a.lop3(11, Src.reg(2), Src.imm(0xcccccccc), sass.zero, 0xc0, .{});
+    a.stg(0, 11, 32, .bits32, .{});
+    a.exit(.{ .stall = 1 });
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+
+    // With a = 0xf0, b = 0xcc and c = 0xaa as the truth-table inputs, the LUT
+    // value is the function itself, so each result is the LUT byte repeated.
+    for (luts, 0..) |lut, i| {
+        const want = @as(u32, lut) * 0x01010101;
+        try std.testing.expectEqual(want, out.read(u32, i));
+    }
+    try std.testing.expectEqual(@as(u32, 0xc0c0c0c0), out.read(u32, 8));
+}
+
+test "live: every register the count covers is writable" {
+    const Src = sass.Src;
+    // The hardware keeps the top two GPRs of the allocation, so `registerCount`
+    // has to leave room for them. Without that, a write to the highest register
+    // the kernel uses is silently dropped.
+    for ([_]u8{ 8, 16, 23, 24, 29, 30, 31, 40, 62, 63 }) |n| {
+        var r = try Runner.init();
+        defer r.deinit();
+        const out = try r.alloc(.system, 0x1000);
+        var code: [512]u32 = undefined;
+        var a = sass.Assembler{ .code = &code };
+        a.movImm(0, @truncate(out.va), .{});
+        a.movImm(1, @intCast(out.va >> 32), .{});
+        a.movImm(n, 0, .{});
+        var i: u8 = 0;
+        while (i < 4) : (i += 1) a.iadd3(n, Src.reg(n), Src.imm(4), sass.zero, .{});
+        a.stg(0, n, 0, .bits32, .{});
+        a.exit(.{ .stall = 1 });
+        const rc = a.registerCount();
+        out.slice(u32)[0] = 0xdead;
+        try r.run(code[0..a.dwords()], .{ .register_count = rc });
+        try std.testing.expectEqual(@as(u32, 16), out.read(u32, 0));
+    }
+}
+
+test "live: each block gets its own shared memory" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const blocks = 6;
+    const threads = 256;
+    const slots = 512; // 2 KB of shared memory, as the tiled matmul uses
+    const Src = sass.Src;
+
+    var code: [512]u32 = undefined;
+    var deps: [128]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    a.s2r(2, sass.SR_TID_X, .{});
+    a.s2r(3, sass.SR_CTAID_X, .{});
+    // Every thread fills two slots with this block's index.
+    a.imad(4, Src.reg(2), Src.imm(4), sass.zero, false, .{});
+    a.sts(4, 3, 0, .bits32, .{});
+    a.sts(4, 3, threads * 4, .bits32, .{});
+    a.bar(.{});
+    // Then every thread checks two slots of its own block's window.
+    a.lds(5, 4, 0, .bits32, .{});
+    a.lds(6, 4, threads * 4, .bits32, .{});
+    a.iadd3(7, Src.reg(5), Src.reg(6), sass.zero, .{});
+    a.imad(8, Src.reg(3), Src.imm(2), sass.zero, false, .{});
+    a.iadd3(9, Src.reg(7), Src.reg(8).negated(), sass.zero, .{}); // zero when right
+    // Accumulate any mismatch into out[block] with a store per thread.
+    a.movImm(10, @truncate(out.va), .{});
+    a.movImm(11, @intCast(out.va >> 32), .{});
+    a.isetp(0, .ne, true, Src.reg(9), Src.imm(0), .{});
+    a.imadWide(12, Src.reg(3), Src.imm(4), Src.reg(10), false, .{});
+    a.stg(12, 9, 0, .bits32, .{ .pred = 0 });
+    a.exit(.{});
+    try a.schedule();
+
+    _ = slots;
+    for (0..8) |_| {
+        @memset(out.slice(u32)[0..blocks], 0);
+        try r.run(code[0..a.dwords()], .{
+            .register_count = a.registerCount(),
+            .grid = .{ blocks, 1, 1 },
+            .block = .{ threads, 1, 1 },
+            .shared_mem_bytes = 2048,
+        });
+        for (0..blocks) |b| try std.testing.expectEqual(@as(u32, 0), out.read(u32, b));
+    }
+}
+
+test "live: a loop that stages through shared memory keeps its blocks in step" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const threads = 256;
+    const rounds = 4;
+    const Src = sass.Src;
+
+    var code: [512]u32 = undefined;
+    var deps: [128]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    a.s2r(2, sass.SR_TID_X, .{}); // tid
+    a.imad(3, Src.reg(2), Src.imm(4), sass.zero, false, .{}); // this thread's slot
+    a.movImm(4, threads - 1, .{});
+    a.imad(5, Src.reg(2), Src.imm(0xffffffff), Src.reg(4), true, .{}); // partner index
+    a.imad(6, Src.reg(5), Src.imm(4), sass.zero, false, .{}); // partner slot
+    a.movImm(7, 0, .{}); // round
+    a.movImm(8, 0, .{}); // mismatches
+
+    const loop = a.here();
+    // Each round writes a value only this round produces, so a thread that runs
+    // ahead of the block reads the wrong one.
+    a.imad(9, Src.reg(7), Src.imm(1000), Src.reg(2), false, .{});
+    a.sts(3, 9, 0, .bits32, .{});
+    a.bar(.{});
+    a.lds(10, 6, 0, .bits32, .{});
+    a.imad(11, Src.reg(7), Src.imm(1000), Src.reg(5), false, .{});
+    a.iadd3(12, Src.reg(10), Src.reg(11).negated(), sass.zero, .{});
+    a.isetp(0, .ne, true, Src.reg(12), Src.imm(0), .{});
+    a.iadd3(8, Src.reg(8), Src.imm(1), sass.zero, .{ .pred = 0 });
+    a.bar(.{});
+    a.iadd3(7, Src.reg(7), Src.imm(1), sass.zero, .{});
+    a.isetp(0, .lt, true, Src.reg(7), Src.imm(rounds), .{});
+    a.bra(loop, .{ .pred = 0 });
+
+    a.movImm(14, @truncate(out.va), .{});
+    a.movImm(15, @intCast(out.va >> 32), .{});
+    a.imadWide(16, Src.reg(2), Src.imm(4), Src.reg(14), false, .{});
+    a.stg(16, 8, 0, .bits32, .{});
+    a.exit(.{});
+    try a.schedule();
+
+    for (0..8) |_| {
+        @memset(out.slice(u32)[0..threads], 0xff);
+        try r.run(code[0..a.dwords()], .{
+            .register_count = a.registerCount(),
+            .block = .{ threads, 1, 1 },
+            .shared_mem_bytes = threads * 4,
+        });
+        for (0..threads) |i| try std.testing.expectEqual(@as(u32, 0), out.read(u32, i));
+    }
+}
