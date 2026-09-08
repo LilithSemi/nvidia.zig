@@ -41,12 +41,13 @@ fn qset(qmd: []u32, lo: usize, width: usize, val: u64) void {
 /// bank 0: set `cbuf0_va` to the GPU VA of a constant buffer and `cbuf0_size` to
 /// its byte size, and the kernel's LDC c[0][off] reads land in that buffer.
 pub const Grid = struct {
-    prog_va: u64,
+    prog_va: u64 = 0, // filled in by `Runner.run`; set it by hand for a raw dispatch
     grid: [3]u32 = .{ 1, 1, 1 }, // CTAs in x, y, z
     block: [3]u32 = .{ 1, 1, 1 }, // threads per CTA in x, y, z
     register_count: u32 = 8, // GPRs per thread (>= the kernel's usage)
     cbuf0_va: u64 = 0, // constant bank 0 GPU VA (0 = no constant buffer bound)
     cbuf0_size: u32 = 0, // constant bank 0 byte size (>= the highest LDC offset read)
+    shared_mem_bytes: u32 = 0, // shared memory per CTA; LDS/STS fault without it
 };
 
 /// Fill a zeroed 64-dword (256-byte) QMD to launch `g`. The QMD must then be
@@ -80,10 +81,14 @@ pub fn buildQmd(qmd: *[QMD_DWORDS]u32, g: Grid) void {
     qset(qmd, 1120, 8, g.block[2]);
     qset(qmd, 1128, 9, g.register_count); // REGISTER_COUNT
     qset(qmd, 1137, 5, 1); // BARRIER_COUNT
-    // SM shared-memory config: min/target = 0 KB, max = 100 KB. hw = kB/4 + 1.
-    qset(qmd, 1163, 6, 1); // MIN_SM_CONFIG_SHARED_MEM_SIZE
+    // Shared memory. The size field counts 128-byte units and the allocation is
+    // rounded to 256 bytes; the min/target/max values name an SM partition size,
+    // which the hardware encodes as kB/4 + 1. Max stays at the full 100 KB.
+    const smem = std.mem.alignForward(u32, g.shared_mem_bytes, 0x100);
+    qset(qmd, 1152, 11, smem >> 7); // SHARED_MEMORY_SIZE_SHIFTED7
+    qset(qmd, 1163, 6, smemConfig(smem)); // MIN_SM_CONFIG_SHARED_MEM_SIZE
     qset(qmd, 1169, 6, 26); // MAX_SM_CONFIG_SHARED_MEM_SIZE
-    qset(qmd, 1175, 6, 1); // TARGET_SM_CONFIG_SHARED_MEM_SIZE
+    qset(qmd, 1175, 6, smemConfig(smem)); // TARGET_SM_CONFIG_SHARED_MEM_SIZE
     qset(qmd, 1248, 32, g.grid[0]); // GRID_WIDTH
     qset(qmd, 1280, 16, g.grid[1]); // GRID_HEIGHT
     qset(qmd, 1312, 16, g.grid[2]); // GRID_DEPTH
@@ -233,4 +238,379 @@ test "live: a hand-assembled SASS compute kernel runs on the SMs and stores" {
         if (semp.* == 0xc0de) break;
     }
     try std.testing.expectEqual(@as(u32, 0xcafe), outp.*);
+}
+
+/// The SM shared-memory partition that holds `bytes`, encoded the way the QMD
+/// wants it: kB/4 + 1. The SM only splits its memory at these sizes, so round up
+/// to the next one instead of asking for an arbitrary amount.
+fn smemConfig(bytes: u32) u32 {
+    const sizes_kb = [_]u32{ 0, 8, 16, 32, 64, 100 };
+    for (sizes_kb) |kb| {
+        if (kb * 1024 >= bytes) return kb / 4 + 1;
+    }
+    return 26; // 100 KB, the largest the SM offers
+}
+
+/// One allocation: the CPU bytes and the GPU virtual address they appear at.
+pub const Buffer = struct {
+    va: u64,
+    bytes: []u8,
+    memory: rm.Memory,
+
+    /// A typed view, for filling the buffer before a launch.
+    pub fn slice(self: Buffer, comptime T: type) []T {
+        return @as([*]T, @ptrCast(@alignCast(self.bytes.ptr)))[0 .. self.bytes.len / @sizeOf(T)];
+    }
+
+    /// Read one element the GPU wrote. The read is volatile because this thread
+    /// did not write the value and must not reuse a cached copy of it.
+    pub fn read(self: Buffer, comptime T: type, index: usize) T {
+        const p: [*]volatile T = @ptrCast(@alignCast(self.bytes.ptr));
+        return p[index];
+    }
+};
+
+/// A ready-to-use compute context: a GPFIFO channel bound to the compute class,
+/// a VA space with a bump allocator behind `alloc`, and the code, descriptor,
+/// pushbuffer and semaphore a launch needs. `run` uploads a kernel, dispatches
+/// it, and waits for it, so a kernel test is a few lines instead of sixty.
+pub const Runner = struct {
+    client: rm.Client,
+    dev: rm.Device,
+    vaspace: sdk.NvHandle,
+    channel: rm.Channel,
+    queue: rm.Queue,
+    next_va: u64 = VA_BASE,
+    seq: u32 = 0,
+    code: Buffer,
+    descriptor: Buffer,
+    push: Buffer,
+    sem: Buffer,
+
+    /// Where the bump allocator starts, and the step between allocations. One
+    /// 2 MB step per buffer keeps every allocation on its own big page.
+    const VA_BASE: u64 = 0x1000_0000;
+    const VA_STEP: u64 = 0x20_0000;
+    const CODE_BYTES = 0x1000; // matches the QMD's 4 KB program prefetch
+    const PUSH_BYTES = 0x1000;
+    const GPFIFO_BYTES = 0x2000;
+    const GPFIFO_ENTRIES = 0x100;
+    /// How long to poll the completion semaphore before calling the grid hung.
+    const SPIN_LIMIT = 200_000_000;
+
+    /// Open GPU 0 and bring up a compute channel on it. Returns
+    /// `error.SkipZigTest` when no GPU is reachable, so tests skip instead of
+    /// failing on a machine without one.
+    pub fn init() !Runner {
+        var client = rm.Client.open() catch return error.SkipZigTest;
+        errdefer client.deinit();
+        const dev = client.allocDevice(0) catch return error.SkipZigTest;
+        errdefer client.freeDevice(dev);
+        const vaspace = try client.allocVaSpace(dev);
+
+        var self: Runner = .{
+            .client = client,
+            .dev = dev,
+            .vaspace = vaspace,
+            .channel = undefined,
+            .queue = undefined,
+            .code = undefined,
+            .descriptor = undefined,
+            .push = undefined,
+            .sem = undefined,
+        };
+
+        // The ring and the USERD are read by the host unit, so they live in VRAM.
+        // Only the ring needs a GPU virtual address.
+        const gpfifo = try self.client.allocMemory(dev, .vram, GPFIFO_BYTES);
+        const gpfifo_va = self.takeVa(GPFIFO_BYTES);
+        _ = try self.client.mapToGpu(dev, vaspace, gpfifo, gpfifo_va);
+        const gpfifo_cpu = try self.client.mapMemory(dev, gpfifo);
+        const userd = try self.client.allocMemory(dev, .vram, 0x1000);
+        const userd_cpu = try self.client.mapMemory(dev, userd);
+
+        // Code and descriptor are write-combined: the CPU only writes them.
+        self.code = try self.alloc(.system_wc, CODE_BYTES);
+        self.descriptor = try self.alloc(.system_wc, QMD_DWORDS * 4);
+        self.push = try self.alloc(.system, PUSH_BYTES);
+        self.sem = try self.alloc(.system, 0x1000);
+
+        const ch = try self.client.allocChannel(
+            dev,
+            sdk.BLACKWELL_CHANNEL_GPFIFO_B,
+            vaspace,
+            gpfifo_va,
+            GPFIFO_ENTRIES,
+            userd,
+        );
+        errdefer self.client.rmFree(dev.client, dev.device, ch.handle);
+        _ = try self.client.allocObject(dev, ch, BLACKWELL_COMPUTE_B);
+        try self.client.bindChannel(dev, ch, sdk.NV2080_ENGINE_TYPE_GRAPHICS);
+        try self.client.scheduleChannel(dev, ch, true);
+        const token = try self.client.workSubmitToken(dev, ch);
+        const usermode = try self.client.allocUsermode(dev, sdk.BLACKWELL_USERMODE_A);
+        const door = try self.client.mapMemory(dev, .{
+            .handle = usermode,
+            .size = 0x1000,
+            .location = .vram,
+        });
+
+        self.channel = ch;
+        self.queue = .{
+            .channel = ch,
+            .token = token,
+            .userd = userd_cpu.bytes,
+            .gpfifo = gpfifo_cpu.bytes,
+            .doorbell = door.bytes,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *Runner) void {
+        self.client.rmFree(self.dev.client, self.dev.device, self.channel.handle);
+        self.client.freeDevice(self.dev);
+        self.client.deinit();
+    }
+
+    fn takeVa(self: *Runner, size: u64) u64 {
+        const va = self.next_va;
+        self.next_va += std.mem.alignForward(u64, size, VA_STEP);
+        return va;
+    }
+
+    /// Allocate `size` bytes, map them to the GPU and to the CPU, and zero them.
+    pub fn alloc(self: *Runner, location: rm.Memory.Location, size: u64) !Buffer {
+        const rounded = std.mem.alignForward(u64, @max(size, 0x1000), 0x1000);
+        const mem = try self.client.allocMemory(self.dev, location, rounded);
+        const va = self.takeVa(rounded);
+        _ = try self.client.mapToGpu(self.dev, self.vaspace, mem, va);
+        const cpu = try self.client.mapMemory(self.dev, mem);
+        @memset(cpu.bytes[0..rounded], 0);
+        return .{ .va = va, .bytes = cpu.bytes[0..rounded], .memory = mem };
+    }
+
+    /// Upload `code`, dispatch grid `g`, and wait for it. `g.prog_va` is filled
+    /// in here. A grid that never signals gives `error.GridTimeout`, which means
+    /// the kernel hung or faulted.
+    pub fn run(self: *Runner, code: []const u32, g: Grid) !void {
+        std.debug.assert(code.len * 4 <= self.code.bytes.len);
+        @memcpy(self.code.slice(u32)[0..code.len], code);
+
+        var grid = g;
+        grid.prog_va = self.code.va;
+        var qmd: [QMD_DWORDS]u32 = undefined;
+        buildQmd(&qmd, grid);
+        @memcpy(self.descriptor.slice(u32)[0..QMD_DWORDS], &qmd);
+
+        var s = Stream{ .buf = self.push.slice(u32) };
+        s.setup();
+        s.dispatch(self.descriptor.va);
+        self.seq += 1;
+        s.fence(self.sem.va, self.seq);
+
+        const semp: *volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
+        semp.* = 0;
+        self.queue.submit(self.push.va, s.dwords());
+        var spins: u64 = 0;
+        while (spins < SPIN_LIMIT) : (spins += 1) {
+            if (semp.* == self.seq) return;
+        }
+        return error.GridTimeout;
+    }
+};
+
+test "live: integer ALU (IADD3, IMAD, IMAD.WIDE, ISETP, SEL) computes on the SMs" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, 7, .{});
+    a.movImm(3, 5, .{});
+    a.iadd3(4, sass.Src.reg(2), sass.Src.reg(3), sass.zero, .{}); // 12
+    a.imad(5, sass.Src.reg(2), sass.Src.reg(3), sass.Src.reg(4), false, .{}); // 47
+    a.isetp(0, .gt, true, sass.Src.reg(5), sass.Src.imm(46), .{}); // P0 = true
+    a.sel(6, sass.Src.reg(2), sass.Src.reg(3), 0, false, .{}); // 7
+    a.imadWide(8, sass.Src.reg(2), sass.Src.imm(4), sass.zero, false, .{}); // 28
+    a.stg(0, 4, 0, .bits32, .{});
+    a.stg(0, 5, 4, .bits32, .{});
+    a.stg(0, 6, 8, .bits32, .{});
+    a.stg(0, 8, 16, .bits64, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(u32, 12), out.read(u32, 0));
+    try std.testing.expectEqual(@as(u32, 47), out.read(u32, 1));
+    try std.testing.expectEqual(@as(u32, 7), out.read(u32, 2));
+    try std.testing.expectEqual(@as(u64, 28), out.read(u64, 2));
+}
+
+test "live: single-precision FADD, FMUL and FFMA compute on the SMs" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.mov(2, sass.Src.float(2.0), .{});
+    a.mov(3, sass.Src.float(3.0), .{});
+    a.fadd(4, sass.Src.reg(2), sass.Src.reg(3), .{}); // 5.0
+    a.fmul(5, sass.Src.reg(2), sass.Src.reg(3), .{}); // 6.0
+    a.ffma(6, sass.Src.reg(2), sass.Src.reg(3), sass.Src.reg(4), .{}); // 11.0
+    a.fadd(7, sass.Src.reg(2), sass.Src.float(1.5), .{}); // 3.5
+    a.fadd(9, sass.Src.reg(2), sass.Src.reg(3).negated(), .{}); // -1.0
+    a.stg(0, 4, 0, .bits32, .{});
+    a.stg(0, 5, 4, .bits32, .{});
+    a.stg(0, 6, 8, .bits32, .{});
+    a.stg(0, 7, 12, .bits32, .{});
+    a.stg(0, 9, 16, .bits32, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(f32, 5.0), out.read(f32, 0));
+    try std.testing.expectEqual(@as(f32, 6.0), out.read(f32, 1));
+    try std.testing.expectEqual(@as(f32, 11.0), out.read(f32, 2));
+    try std.testing.expectEqual(@as(f32, 3.5), out.read(f32, 3));
+    try std.testing.expectEqual(@as(f32, -1.0), out.read(f32, 4));
+}
+
+test "live: LDC reads kernel parameters out of constant bank 0" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const params = try r.alloc(.system, 0x1000);
+    const pw = params.slice(u32);
+    pw[0] = 0xa11ce;
+    pw[1] = 0xb0b;
+    pw[2] = 0xfeed;
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    // Constant reads have no fixed latency: each LDC sets a scoreboard and the
+    // store that consumes the result waits on it.
+    a.ldc(2, .{ .bank = 0, .offset = 0 }, sass.RZ, .bits32, .{ .wr_barrier = 0 });
+    a.ldc(3, .{ .bank = 0, .offset = 4 }, sass.RZ, .bits32, .{ .wr_barrier = 1 });
+    a.movImm(4, 8, .{});
+    a.ldc(5, .{ .bank = 0, .offset = 0 }, 4, .bits32, .{ .wr_barrier = 2 }); // indexed
+    a.stg(0, 2, 0, .bits32, .{ .wait_mask = 0b001 });
+    a.stg(0, 3, 4, .bits32, .{ .wait_mask = 0b010 });
+    a.stg(0, 5, 8, .bits32, .{ .wait_mask = 0b100 });
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{
+        .register_count = a.registerCount(),
+        .cbuf0_va = params.va,
+        .cbuf0_size = 256,
+    });
+    try std.testing.expectEqual(@as(u32, 0xa11ce), out.read(u32, 0));
+    try std.testing.expectEqual(@as(u32, 0xb0b), out.read(u32, 1));
+    try std.testing.expectEqual(@as(u32, 0xfeed), out.read(u32, 2));
+}
+
+test "live: LDG reads global memory back into a register" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const in = try r.alloc(.system, 0x1000);
+    for (in.slice(u32)[0..8], 0..) |*w, i| w.* = @intCast(0x100 + i);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, @truncate(in.va), .{});
+    a.movImm(3, @intCast(in.va >> 32), .{});
+    // A global load has no fixed latency, so it sets scoreboard 0 and the store
+    // that consumes the result waits on it.
+    a.ldg(4, 2, 12, .bits32, .{ .wr_barrier = 0 });
+    a.ldg(6, 2, 0, .bits64, .{ .wr_barrier = 1 });
+    a.stg(0, 4, 0, .bits32, .{ .wait_mask = 0b01 });
+    a.stg(0, 6, 8, .bits64, .{ .wait_mask = 0b10 });
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(u32, 0x103), out.read(u32, 0));
+    try std.testing.expectEqual(@as(u32, 0x100), out.read(u32, 2));
+    try std.testing.expectEqual(@as(u32, 0x101), out.read(u32, 3));
+}
+
+test "live: a predicated backward branch runs a counted loop" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, 0, .{}); // accumulator
+    a.movImm(3, 0, .{}); // counter
+    const loop = a.here();
+    a.iadd3(2, sass.Src.reg(2), sass.Src.reg(3), sass.zero, .{});
+    a.iadd3(3, sass.Src.reg(3), sass.Src.imm(1), sass.zero, .{});
+    a.isetp(0, .lt, true, sass.Src.reg(3), sass.Src.imm(10), .{});
+    a.bra(loop, .{ .pred = 0 });
+    a.stg(0, 2, 0, .bits32, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(u32, 45), out.read(u32, 0)); // 0+1+..+9
+}
+
+test "live: a forward branch skips the instructions it jumps over" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(2, 0x600d, .{});
+    const skip = a.braForward(.{});
+    // A branch that lands short writes one of these markers instead.
+    a.movImm(2, 0xbad1, .{});
+    a.movImm(2, 0xbad2, .{});
+    a.movImm(2, 0xbad3, .{});
+    a.patchBranch(skip, a.here());
+    a.stg(0, 2, 0, .bits32, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    try std.testing.expectEqual(@as(u32, 0x600d), out.read(u32, 0));
+}
+
+test "live: every thread of a grid writes its own global index" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.s2r(2, sass.SR_TID_X, .{ .wr_barrier = 0 });
+    a.s2r(3, sass.SR_CTAID_X, .{ .wr_barrier = 1 });
+    // index = ctaid.x * 8 + tid.x
+    a.imad(4, sass.Src.reg(3), sass.Src.imm(8), sass.Src.reg(2), false, .{ .wait_mask = 0b11 });
+    // The output address is the base plus index*4, built with a wide multiply.
+    a.movImm(6, @truncate(out.va), .{});
+    a.movImm(7, @intCast(out.va >> 32), .{});
+    a.imadWide(0, sass.Src.reg(4), sass.Src.imm(4), sass.Src.reg(6), false, .{});
+    a.stg(0, 4, 0, .bits32, .{});
+    a.exit(.{ .stall = 1 });
+
+    try r.run(code[0..a.dwords()], .{
+        .register_count = a.registerCount(),
+        .grid = .{ 4, 1, 1 },
+        .block = .{ 8, 1, 1 },
+    });
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), out.read(u32, i));
+    }
 }

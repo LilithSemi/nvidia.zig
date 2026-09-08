@@ -1,17 +1,23 @@
 //! Minimal hand-assembler for NVIDIA SASS, the native GPU ISA. The instruction
 //! encoding is shared Volta..Blackwell (only per-instruction latencies differ),
 //! so one encoder serves all of them. Each instruction is 128 bits (4 dwords).
-//! Verified live on Blackwell (sm_120): a MOV/STG/EXIT kernel runs on the SMs.
+//! Verified live on Blackwell (sm_120): the kernels the tests at the bottom of
+//! this file assemble run on the SMs.
 //!
 //! Scheduling: each instruction carries a `Control` with a stall count (cycles
 //! before the next instruction) and optional scoreboard barriers. The default
 //! stall is conservative - enough to cover a back-to-back fixed-latency register
 //! dependency. Variable-latency ops (global loads, texture) need scoreboard
 //! barriers via `Control.wr_barrier`/`wait_mask`; a real scheduler is future work.
+//!
+//! Uniform registers (UGPR) are encoded in 8 bits here, which is the Blackwell
+//! (sm >= 100) width. Volta..Ada use 6 bits and need a per-generation switch
+//! before this encoder can target them.
 
 const std = @import("std");
 
 pub const RZ: u8 = 255; // the zero GPR
+pub const URZ: u8 = 255; // the zero uniform GPR (8-bit UGPR field, sm >= 100)
 pub const PT: u8 = 7; // the always-true predicate register
 
 /// Set `width` bits at bit offset `lo` within a 128-bit instruction.
@@ -25,24 +31,137 @@ fn setBits(inst: []u32, lo: usize, width: usize, val: u64) void {
     }
 }
 
-/// Per-instruction scheduling. On Blackwell (sm>=120) the yield/reuse bits are
-/// dropped, so only the stall, barriers, and wait mask are encoded.
+/// Keep the low `width` bits of a two's-complement value, for the signed
+/// immediate fields (memory offsets, branch offsets).
+fn signedBits(val: i64, width: usize) u64 {
+    const mask: u64 = if (width >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(width)) - 1;
+    return @as(u64, @bitCast(val)) & mask;
+}
+
+/// A constant-bank reference, `c[bank][offset]`. `offset` is a byte offset and
+/// must be 4-aligned. Kernel parameters live in bank 0, which the QMD binds.
+pub const CBuf = struct {
+    bank: u5 = 0,
+    offset: u16,
+};
+
+/// An ALU operand. The hardware reads the first operand from a register only.
+/// The second and third can each be a register or a 32-bit immediate, and which
+/// one holds the immediate selects the instruction "form" in bits 9..11.
+///
+/// The ISA also lets an ALU operand read a constant bank directly. That form is
+/// not here: every encoding of it tried so far raises "Illegal Instruction
+/// Encoding" on Blackwell silicon, so a kernel loads the constant with `ldc`
+/// first. Add it back only with a live test that passes.
+pub const Src = struct {
+    ref: Ref,
+    abs: bool = false, // absolute value (float sources only)
+    neg: bool = false, // negate (float sources, and integer add/multiply)
+
+    pub const Ref = union(enum) {
+        reg: u8,
+        imm: u32,
+    };
+
+    pub fn reg(n: u8) Src {
+        return .{ .ref = .{ .reg = n } };
+    }
+    pub fn imm(v: u32) Src {
+        return .{ .ref = .{ .imm = v } };
+    }
+    pub fn float(v: f32) Src {
+        return .{ .ref = .{ .imm = @bitCast(v) } };
+    }
+
+    pub fn negated(self: Src) Src {
+        var s = self;
+        s.neg = !s.neg;
+        return s;
+    }
+    pub fn absolute(self: Src) Src {
+        var s = self;
+        s.abs = true;
+        return s;
+    }
+
+    fn isReg(self: Src) bool {
+        return switch (self.ref) {
+            .reg => true,
+            else => false,
+        };
+    }
+    fn regIndex(self: Src) u8 {
+        return switch (self.ref) {
+            .reg => |r| r,
+            else => unreachable, // this operand slot only accepts a register
+        };
+    }
+};
+
+/// The zero register as an operand. Reads as 0, writes are dropped.
+pub const zero = Src.reg(RZ);
+
+/// The width of one memory access, and how the loaded bits are extended.
+pub const MemType = enum(u3) {
+    unsigned8 = 0,
+    signed8 = 1,
+    unsigned16 = 2,
+    signed16 = 3,
+    bits32 = 4,
+    bits64 = 5,
+    bits128 = 6,
+
+    /// How many consecutive GPRs the access reads or writes.
+    fn regs(self: MemType) u8 {
+        return switch (self) {
+            .bits64 => 2,
+            .bits128 => 4,
+            else => 1,
+        };
+    }
+};
+
+/// How far a memory barrier reaches.
+pub const MemScope = enum(u3) {
+    cta = 0,
+    gpu = 2,
+    system = 3,
+};
+
+/// The integer comparison an ISETP applies.
+pub const IntCmp = enum(u3) {
+    never = 0,
+    lt = 1,
+    eq = 2,
+    le = 3,
+    gt = 4,
+    ne = 5,
+    ge = 6,
+    always = 7,
+};
+
+/// Per-instruction scheduling and predication. On Blackwell (sm >= 120) the
+/// yield/reuse bits are dropped, so only the stall, barriers, wait mask, and
+/// guard predicate are encoded.
 pub const Control = struct {
     stall: u4 = 15, // conservative; covers a fixed-latency register dependency
     wr_barrier: u3 = 7, // write scoreboard to set on completion (7 = none)
     rd_barrier: u3 = 7, // read scoreboard to set (7 = none)
     wait_mask: u6 = 0, // scoreboards to wait on before issue
+    /// Guard predicate. The instruction runs only when predicate register `pred`
+    /// holds the value opposite to `pred_not`. The default PT is always true, so
+    /// the instruction is unconditional.
+    pred: u8 = PT,
+    pred_not: bool = false,
 };
 
 fn putControl(inst: []u32, c: Control) void {
+    setBits(inst, 12, 3, c.pred);
+    setBits(inst, 15, 1, @intFromBool(c.pred_not));
     setBits(inst, 105, 4, c.stall);
     setBits(inst, 110, 3, c.wr_barrier);
     setBits(inst, 113, 3, c.rd_barrier);
     setBits(inst, 116, 6, c.wait_mask);
-}
-
-fn putPredTrue(inst: []u32) void {
-    setBits(inst, 12, 3, PT); // unconditional (predicate PT)
 }
 
 /// Emits 128-bit SASS instructions into a caller-provided dword buffer (4 dwords
@@ -62,10 +181,20 @@ pub const Assembler = struct {
     fn note(self: *Assembler, reg: u8) void {
         if (reg != RZ and reg > self.max_reg) self.max_reg = reg;
     }
+    /// Record a run of `count` registers starting at `first`.
+    fn noteRun(self: *Assembler, first: u8, count: u8) void {
+        if (first == RZ) return;
+        self.note(first + count - 1);
+    }
 
     /// Program size in dwords (bytes = dwords()*4).
     pub fn dwords(self: *const Assembler) usize {
         return self.n;
+    }
+    /// Index of the instruction that the next emit lands on. Use it as a branch
+    /// target and as the argument to `patchBranch`.
+    pub fn here(self: *const Assembler) usize {
+        return self.n / 4;
     }
     /// A safe register count for the QMD: highest GPR used + 1, rounded up to the
     /// hardware allocation granularity (multiples of 8, minimum 16).
@@ -74,96 +203,482 @@ pub const Assembler = struct {
         return @max(16, (used + 7) & ~@as(u32, 7));
     }
 
+    // -----------------------------------------------------------------------
+    // ALU operand encoding. The three operand slots are: src0 at bits 24..31
+    // (register only), src1 at bits 32..63 (register, immediate, or constant
+    // bank), and src2 at bits 64..71 (register). A non-register operand always
+    // occupies the 32..63 slot, so when the third operand is the non-register
+    // one the second moves into the 64..71 slot and the form changes.
+    // -----------------------------------------------------------------------
+
+    fn putSrc2(self: *Assembler, w: []u32, s: ?Src) void {
+        const src = s orelse return;
+        const r = src.regIndex();
+        self.note(r);
+        setBits(w, 64, 8, r);
+        setBits(w, 74, 1, @intFromBool(src.abs));
+        setBits(w, 75, 1, @intFromBool(src.neg));
+    }
+
+    /// Fill the 32..63 slot and return the form it selects.
+    fn putSrc1(self: *Assembler, w: []u32, s: ?Src) u32 {
+        const src = s orelse return 1;
+        switch (src.ref) {
+            .reg => |r| {
+                self.note(r);
+                setBits(w, 32, 8, r);
+                setBits(w, 62, 1, @intFromBool(src.abs));
+                setBits(w, 63, 1, @intFromBool(src.neg));
+                return 1;
+            },
+            .imm => |v| {
+                setBits(w, 32, 32, v);
+                return 4;
+            },
+        }
+    }
+
+    fn encodeAlu(self: *Assembler, w: []u32, opcode: u32, dst: ?u8, src0: ?Src, src1: ?Src, src2: ?Src) void {
+        if (dst) |d| {
+            self.note(d);
+            setBits(w, 16, 8, d);
+        }
+        if (src0) |s| {
+            const r = s.regIndex();
+            self.note(r);
+            setBits(w, 24, 8, r);
+            setBits(w, 73, 1, @intFromBool(s.abs));
+            setBits(w, 72, 1, @intFromBool(s.neg));
+        }
+        var form: u32 = 1;
+        if (src2) |s2| {
+            switch (s2.ref) {
+                .reg => {
+                    self.putSrc2(w, s2);
+                    form = self.putSrc1(w, src1);
+                },
+                .imm => |v| {
+                    setBits(w, 32, 32, v);
+                    self.putSrc2(w, src1);
+                    form = 2;
+                },
+            }
+        } else {
+            form = self.putSrc1(w, src1);
+        }
+        setBits(w, 0, 9, opcode);
+        setBits(w, 9, 3, form);
+    }
+
+    // -----------------------------------------------------------------------
+    // Moves
+    // -----------------------------------------------------------------------
+
+    /// MOV dst, src - copy 32 bits from a register or an immediate.
+    pub fn mov(self: *Assembler, dst: u8, src: Src, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x002, dst, null, src, null);
+        setBits(w, 72, 4, 0xf); // all quad lanes
+        putControl(w, ctl);
+    }
+
     /// MOV dst, imm32 - load a 32-bit immediate into a GPR.
-    pub fn movImm(self: *Assembler, dst: u8, imm: u32, c: Control) void {
-        self.note(dst);
-        const w = self.next();
-        setBits(w, 0, 9, 0x002); // ALU MOV
-        setBits(w, 9, 3, 4); // form: 32-bit immediate
-        putPredTrue(w);
-        setBits(w, 16, 8, dst);
-        setBits(w, 32, 32, imm);
-        setBits(w, 72, 4, 0xf); // all quad lanes
-        putControl(w, c);
+    pub fn movImm(self: *Assembler, dst: u8, imm: u32, ctl: Control) void {
+        self.mov(dst, Src.imm(imm), ctl);
     }
 
-    /// MOV dst, src - copy a 32-bit GPR. ALU MOV (0x002) with the register source
-    /// form (form 1): src register at bits 32..39, no immediate.
-    pub fn movReg(self: *Assembler, dst: u8, src: u8, c: Control) void {
-        self.note(dst);
-        self.note(src);
-        const w = self.next();
-        setBits(w, 0, 9, 0x002); // ALU MOV
-        setBits(w, 9, 3, 1); // form: register source
-        putPredTrue(w);
-        setBits(w, 16, 8, dst);
-        setBits(w, 32, 8, src); // src register (encode_alu_reg bits 32..40)
-        setBits(w, 72, 4, 0xf); // all quad lanes
-        putControl(w, c);
+    /// MOV dst, src - copy a 32-bit GPR.
+    pub fn movReg(self: *Assembler, dst: u8, src: u8, ctl: Control) void {
+        self.mov(dst, Src.reg(src), ctl);
     }
 
-    /// STG.E.STRONG.SYS [addr:addr+1], data - store the 32-bit GPR `data` to the
-    /// 64-bit global address held in the register pair (addr, addr+1). `addr`
-    /// must be even.
-    pub fn stgU32(self: *Assembler, addr: u8, data: u8, c: Control) void {
-        self.note(addr + 1);
-        self.note(data);
+    /// SEL dst, a, b - dst = a when the guard predicate holds, else b. Unlike a
+    /// predicated MOV this always writes dst, so it needs no fall-through path.
+    pub fn sel(self: *Assembler, dst: u8, a: Src, b: Src, pred: u8, pred_not: bool, ctl: Control) void {
         const w = self.next();
-        setBits(w, 0, 12, 0x986); // STG global (UGPR form)
-        putPredTrue(w);
-        setBits(w, 24, 8, addr);
-        setBits(w, 90, 1, 1); // 64-bit GPR address (addr:addr+1)
-        setBits(w, 64, 8, RZ); // URZ uniform base
-        setBits(w, 72, 1, 1); // 64-bit uniform
-        setBits(w, 32, 8, data);
-        setBits(w, 73, 3, 4); // type B32
+        self.encodeAlu(w, 0x007, dst, a, b, null);
+        setBits(w, 87, 3, pred);
+        setBits(w, 90, 1, @intFromBool(pred_not));
+        putControl(w, ctl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integer arithmetic. IADD3 and IMAD carry nearly all integer work on this
+    // ISA, address math included.
+    // -----------------------------------------------------------------------
+
+    /// IADD3 dst, a, b, c - dst = a + b + c, 32-bit. Negate an operand with
+    /// `Src.negated` to subtract. The hardware needs at least one of a and b
+    /// unmodified.
+    pub fn iadd3(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, ctl: Control) void {
+        std.debug.assert(!a.neg or !b.neg);
+        const w = self.next();
+        self.encodeAlu(w, 0x010, dst, a, b, c);
+        setBits(w, 87, 3, PT); // carry-in = false
+        setBits(w, 90, 1, 1);
+        setBits(w, 77, 3, PT); // second carry-in = false
+        setBits(w, 80, 1, 1);
+        setBits(w, 81, 3, PT); // no carry-out
+        setBits(w, 84, 3, PT); // no second carry-out
+        putControl(w, ctl);
+    }
+
+    /// IADD dst, a, b - the two-operand add (IADD3 with a zero third operand).
+    pub fn iadd(self: *Assembler, dst: u8, a: Src, b: Src, ctl: Control) void {
+        self.iadd3(dst, a, b, zero, ctl);
+    }
+
+    /// IMAD dst, a, b, c - dst = a*b + c, 32-bit.
+    pub fn imad(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, signed: bool, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x024, dst, a, b, c);
+        setBits(w, 81, 3, PT); // no predicate destination
+        setBits(w, 73, 1, @intFromBool(signed));
+        putControl(w, ctl);
+    }
+
+    /// IMAD.WIDE dst:dst+1, a, b, c:c+1 - a 32x32 multiply added to a 64-bit
+    /// value, giving a 64-bit result. This builds global addresses: multiply an
+    /// element index by the element size and add the 64-bit base pointer.
+    /// `dst` and a register `c` must both be even.
+    pub fn imadWide(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, signed: bool, ctl: Control) void {
+        std.debug.assert(dst % 2 == 0);
+        self.noteRun(dst, 2);
+        if (c.isReg()) {
+            std.debug.assert(c.regIndex() % 2 == 0 or c.regIndex() == RZ);
+            self.noteRun(c.regIndex(), 2);
+        }
+        const w = self.next();
+        self.encodeAlu(w, 0x025, dst, a, b, c);
+        setBits(w, 81, 3, PT);
+        setBits(w, 73, 1, @intFromBool(signed));
+        putControl(w, ctl);
+    }
+
+    /// LOP3.LUT dst, a, b, c - an arbitrary bitwise function of three operands.
+    /// `lut` is the truth table: with a = 0xf0, b = 0xcc and c = 0xaa as inputs,
+    /// evaluate the function you want and pass the result (a & b is 0xc0,
+    /// a | b is 0xfc, a ^ b is 0x3c).
+    pub fn lop3(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, lut: u8, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x012, dst, a, b, c);
+        setBits(w, 72, 8, lut);
+        setBits(w, 80, 1, 0); // no .PAND
+        setBits(w, 81, 3, PT); // no predicate destination
+        setBits(w, 87, 3, PT); // predicate input = false
+        setBits(w, 90, 1, 1);
+        putControl(w, ctl);
+    }
+
+    /// SHF.L.U32 dst, a, shift - shift left. This ISA has only the funnel shift,
+    /// so a plain shift is a funnel shift with a zero high half.
+    pub fn shl(self: *Assembler, dst: u8, a: Src, shift: Src, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x019, dst, a, shift, zero);
+        setBits(w, 73, 2, 3); // U32
+        setBits(w, 75, 1, 0); // clamp the shift amount, do not wrap it
+        setBits(w, 76, 1, 0); // left
+        setBits(w, 80, 1, 0); // take the low half of the funnel
+        putControl(w, ctl);
+    }
+
+    /// SHF.R.U32.HI dst, a, shift - logical shift right. The value goes in the
+    /// high half of the funnel and the result comes from the high half too.
+    pub fn shr(self: *Assembler, dst: u8, a: Src, shift: Src, signed: bool, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x019, dst, zero, shift, a);
+        setBits(w, 73, 2, if (signed) 2 else 3); // I32 / U32
+        setBits(w, 75, 1, 0);
+        setBits(w, 76, 1, 1); // right
+        setBits(w, 80, 1, 1); // take the high half of the funnel
+        putControl(w, ctl);
+    }
+
+    /// ISETP.<cmp> dst, a, b - compare two integers into a predicate register.
+    pub fn isetp(self: *Assembler, dst: u8, cmp: IntCmp, signed: bool, a: Src, b: Src, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x00c, null, a, b, null);
+        setBits(w, 68, 3, PT); // low-half compare input = false
+        setBits(w, 71, 1, 1);
+        setBits(w, 87, 3, PT); // accumulator = true, so dst is the compare alone
+        setBits(w, 90, 1, 0);
+        setBits(w, 72, 1, 0); // not the 64-bit extended form
+        setBits(w, 73, 1, @intFromBool(signed));
+        setBits(w, 74, 2, 0); // combine with the accumulator through AND
+        setBits(w, 76, 3, @intFromEnum(cmp));
+        setBits(w, 81, 3, dst);
+        setBits(w, 84, 3, PT); // no second destination
+        putControl(w, ctl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Floating point (32-bit). All three round to nearest even.
+    // -----------------------------------------------------------------------
+
+    /// FADD dst, a, b - single-precision add.
+    pub fn fadd(self: *Assembler, dst: u8, a: Src, b: Src, ctl: Control) void {
+        const w = self.next();
+        // A non-register second operand has to go through the third slot, which
+        // is also what fills the 64..71 register slot with the zero register.
+        if (b.isReg()) {
+            self.encodeAlu(w, 0x021, dst, a, b, null);
+        } else {
+            self.encodeAlu(w, 0x021, dst, a, zero, b);
+        }
+        setBits(w, 77, 1, 0); // no saturate
+        setBits(w, 78, 2, 0); // round to nearest even
+        setBits(w, 80, 1, 0); // no flush-to-zero
+        putControl(w, ctl);
+    }
+
+    /// FMUL dst, a, b - single-precision multiply.
+    pub fn fmul(self: *Assembler, dst: u8, a: Src, b: Src, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x020, dst, a, b, zero);
+        setBits(w, 76, 1, 0); // no denormal-to-zero
+        setBits(w, 77, 1, 0); // no saturate
+        setBits(w, 78, 2, 0); // round to nearest even
+        setBits(w, 80, 1, 0); // no flush-to-zero
+        setBits(w, 84, 3, 4); // no post-multiply divide
+        putControl(w, ctl);
+    }
+
+    /// FFMA dst, a, b, c - single-precision fused multiply-add, dst = a*b + c.
+    /// This is the inner loop of every dense matrix kernel.
+    pub fn ffma(self: *Assembler, dst: u8, a: Src, b: Src, c: Src, ctl: Control) void {
+        const w = self.next();
+        self.encodeAlu(w, 0x023, dst, a, b, c);
+        setBits(w, 76, 1, 0); // no denormal-to-zero
+        setBits(w, 77, 1, 0); // no saturate
+        setBits(w, 78, 2, 0); // round to nearest even
+        setBits(w, 80, 1, 0); // no flush-to-zero
+        putControl(w, ctl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory
+    // -----------------------------------------------------------------------
+
+    fn putGlobalAccess(w: []u32, mem_type: MemType, offset: i32) void {
+        std.debug.assert(offset >= -(1 << 23) and offset < (1 << 23));
+        setBits(w, 40, 24, signedBits(offset, 24));
+        setBits(w, 73, 3, @intFromEnum(mem_type));
         setBits(w, 77, 4, 0xa); // order STRONG, scope SYS
         setBits(w, 84, 3, 1); // eviction NORMAL
+        setBits(w, 90, 1, 1); // the GPR address is a 64-bit register pair
         setBits(w, 91, 1, 1); // UGPR mode (required, or the SM traps)
-        putControl(w, c);
     }
 
-    /// S2R dst, sysval - read a special/system register (e.g. the vertex ID)
-    /// into a GPR. Variable latency: set a `wr_barrier` and have the consumer
-    /// wait on it.
-    pub fn s2r(self: *Assembler, dst: u8, sysval: u8, c: Control) void {
+    /// LDG.E dst, [addr:addr+1 + offset] - load from global memory through the
+    /// 64-bit address in the register pair (addr, addr+1). `addr` must be even.
+    /// Variable latency: set `ctl.wr_barrier` and make the consumer wait on it.
+    pub fn ldg(self: *Assembler, dst: u8, addr: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        self.noteRun(dst, mem_type.regs());
+        self.noteRun(addr, 2);
+        const w = self.next();
+        setBits(w, 0, 12, 0x981);
+        setBits(w, 16, 8, dst);
+        setBits(w, 24, 8, addr);
+        setBits(w, 32, 8, URZ); // no uniform base register
+        setBits(w, 72, 1, 1); // ... and it counts as 64-bit
+        setBits(w, 64, 3, 0); // guard predicate = true (this field counts down)
+        setBits(w, 67, 1, 0);
+        setBits(w, 81, 3, PT); // no predicate destination
+        putGlobalAccess(w, mem_type, offset);
+        putControl(w, ctl);
+    }
+
+    /// STG.E.STRONG.SYS [addr:addr+1 + offset], data - store to global memory
+    /// through the 64-bit address in the register pair (addr, addr+1). `addr`
+    /// must be even.
+    pub fn stg(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        self.noteRun(addr, 2);
+        self.noteRun(data, mem_type.regs());
+        const w = self.next();
+        setBits(w, 0, 12, 0x986);
+        setBits(w, 24, 8, addr);
+        setBits(w, 32, 8, data);
+        setBits(w, 64, 8, URZ); // no uniform base register
+        setBits(w, 72, 1, 1); // ... and it counts as 64-bit
+        putGlobalAccess(w, mem_type, offset);
+        putControl(w, ctl);
+    }
+
+    /// STG of one 32-bit register, the common case.
+    pub fn stgU32(self: *Assembler, addr: u8, data: u8, ctl: Control) void {
+        self.stg(addr, data, 0, .bits32, ctl);
+    }
+
+    /// LDS dst, [addr + offset] - load from the CTA's shared memory. The address
+    /// is a byte offset inside the block's shared window, not a global address.
+    pub fn lds(self: *Assembler, dst: u8, addr: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        std.debug.assert(offset >= -(1 << 23) and offset < (1 << 23));
+        self.noteRun(dst, mem_type.regs());
+        self.note(addr);
+        const w = self.next();
+        setBits(w, 0, 12, 0x984);
+        setBits(w, 16, 8, dst);
+        setBits(w, 24, 8, addr);
+        setBits(w, 32, 8, URZ);
+        setBits(w, 40, 24, signedBits(offset, 24));
+        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 78, 2, 0); // address stride x1
+        setBits(w, 87, 1, 0); // no predicate result
+        setBits(w, 91, 1, 1);
+        putControl(w, ctl);
+    }
+
+    /// STS [addr + offset], data - store to the CTA's shared memory.
+    pub fn sts(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        std.debug.assert(offset >= -(1 << 23) and offset < (1 << 23));
+        self.note(addr);
+        self.noteRun(data, mem_type.regs());
+        const w = self.next();
+        setBits(w, 0, 12, 0x988);
+        setBits(w, 24, 8, addr);
+        setBits(w, 32, 8, data);
+        setBits(w, 64, 8, URZ);
+        setBits(w, 40, 24, signedBits(offset, 24));
+        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 78, 2, 0); // address stride x1
+        setBits(w, 91, 1, 1);
+        putControl(w, ctl);
+    }
+
+    /// LDC dst, c[bank][cb.offset + index] - read the constant bank through the
+    /// constant cache. `index` is a GPR holding a byte offset, or RZ for a
+    /// static read. Kernel parameters bound by the QMD in bank 0 are read here.
+    pub fn ldc(self: *Assembler, dst: u8, cb: CBuf, index: u8, mem_type: MemType, ctl: Control) void {
+        std.debug.assert(cb.offset % 4 == 0);
+        self.noteRun(dst, mem_type.regs());
+        self.note(index);
+        const w = self.next();
+        setBits(w, 0, 12, 0xb82);
+        setBits(w, 16, 8, dst);
+        setBits(w, 24, 8, index);
+        setBits(w, 38, 16, cb.offset);
+        setBits(w, 54, 5, cb.bank);
+        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 78, 2, 0); // indexed mode
+        setBits(w, 80, 2, 0); // no texture-header unpack (sm >= 120)
+        setBits(w, 91, 1, 0); // bound bank, not a bindless handle
+        putControl(w, ctl);
+    }
+
+    /// MEMBAR - order this thread's memory traffic up to `scope` before any that
+    /// follows. Needed between a store and a read of it by another CTA.
+    pub fn membar(self: *Assembler, scope: MemScope, ctl: Control) void {
+        const w = self.next();
+        setBits(w, 0, 12, 0x992);
+        setBits(w, 72, 1, 0); // not MMIO
+        setBits(w, 76, 3, @intFromEnum(scope));
+        setBits(w, 80, 1, 0); // not the strong-cached form
+        putControl(w, ctl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Control flow
+    // -----------------------------------------------------------------------
+
+    /// BAR.SYNC - the CTA barrier. Every thread of the block waits here, and all
+    /// shared-memory writes made before it are visible to the block after it.
+    pub fn bar(self: *Assembler, ctl: Control) void {
+        const w = self.next();
+        setBits(w, 0, 12, 0xb1d);
+        putControl(w, ctl);
+    }
+
+    fn putBranchOffset(w: []u32, from: usize, target: usize) void {
+        // The hardware offset is relative to the instruction after the branch
+        // and counts 4-byte units, so one instruction is 4.
+        const delta = (@as(i64, @intCast(target)) - @as(i64, @intCast(from)) - 1) * 4;
+        const bits = signedBits(delta, 56);
+        setBits(w, 16, 8, bits & 0xff);
+        setBits(w, 34, 48, bits >> 8);
+    }
+
+    /// BRA target - branch to instruction index `target`. `ctl.pred` is the
+    /// branch condition, so a non-PT predicate makes the branch conditional.
+    pub fn bra(self: *Assembler, target: usize, ctl: Control) void {
+        const from = self.here();
+        const w = self.next();
+        setBits(w, 0, 12, 0x947);
+        setBits(w, 32, 1, 0); // not the uniform-branch form
+        putBranchOffset(w, from, target);
+        // A branch takes its condition from the 87..89 field, not the usual
+        // guard predicate, so the guard itself stays unconditional.
+        var guard = ctl;
+        guard.pred = PT;
+        guard.pred_not = false;
+        putControl(w, guard);
+        setBits(w, 87, 3, ctl.pred);
+        setBits(w, 90, 1, @intFromBool(ctl.pred_not));
+    }
+
+    /// Emit a BRA whose target is not known yet, and return its instruction
+    /// index. Call `patchBranch` with that index once the target is emitted.
+    pub fn braForward(self: *Assembler, ctl: Control) usize {
+        const at = self.here();
+        self.bra(at + 1, ctl); // provisional: fall through
+        return at;
+    }
+
+    /// Point the branch at instruction index `at` to instruction index `target`.
+    pub fn patchBranch(self: *Assembler, at: usize, target: usize) void {
+        std.debug.assert(at * 4 < self.n);
+        putBranchOffset(self.code[at * 4 ..][0..4], at, target);
+    }
+
+    /// EXIT - terminate the warp.
+    pub fn exit(self: *Assembler, ctl: Control) void {
+        const w = self.next();
+        setBits(w, 0, 12, 0x94d);
+        setBits(w, 87, 3, 7); // condition-code test = always
+        putControl(w, ctl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Special registers and shader attributes
+    // -----------------------------------------------------------------------
+
+    /// S2R dst, sysval - read a special/system register (thread id, CTA id, the
+    /// vertex id) into a GPR. Variable latency: set a `wr_barrier` and have the
+    /// consumer wait on it.
+    pub fn s2r(self: *Assembler, dst: u8, sysval: u8, ctl: Control) void {
         self.note(dst);
         const w = self.next();
         setBits(w, 0, 12, 0x919);
-        putPredTrue(w);
         setBits(w, 16, 8, dst);
         setBits(w, 72, 8, sysval);
-        putControl(w, c);
+        putControl(w, ctl);
     }
 
     /// ALD dst..dst+comps-1, a[addr] - load `comps` shader input-attribute words
     /// (e.g. a fetched vertex attribute) into consecutive GPRs. Variable latency.
-    pub fn ald(self: *Assembler, dst: u8, addr: u16, comps: u8, c: Control) void {
+    pub fn ald(self: *Assembler, dst: u8, addr: u16, comps: u8, ctl: Control) void {
         self.note(dst + comps - 1);
         const w = self.next();
         setBits(w, 0, 12, 0x321);
-        putPredTrue(w);
         setBits(w, 16, 8, dst);
         setBits(w, 32, 8, RZ); // vertex (RZ: not per-vertex addressed)
         setBits(w, 24, 8, RZ); // dynamic offset (RZ: static)
         setBits(w, 40, 10, addr);
         setBits(w, 74, 2, comps - 1);
-        putControl(w, c);
+        putControl(w, ctl);
     }
 
     /// AST o[addr], data..data+comps-1 - store `comps` GPRs to a shader
     /// output attribute (e.g. the clip-space position at ATTR_POSITION).
-    pub fn ast(self: *Assembler, addr: u16, data: u8, comps: u8, c: Control) void {
+    pub fn ast(self: *Assembler, addr: u16, data: u8, comps: u8, ctl: Control) void {
         self.note(data + comps - 1);
         const w = self.next();
         setBits(w, 0, 12, 0x322);
-        putPredTrue(w);
         setBits(w, 32, 8, data);
         setBits(w, 64, 8, RZ); // vertex
         setBits(w, 24, 8, RZ); // dynamic offset
         setBits(w, 40, 10, addr);
         setBits(w, 74, 2, comps - 1);
-        putControl(w, c);
+        putControl(w, ctl);
     }
 
     /// IPA dst, a[addr] - interpolate one component (one dword) of a fragment
@@ -173,28 +688,18 @@ pub const Assembler = struct {
     /// multiply, no load_barycentric setup). `addr` is the attribute BYTE
     /// address (must be 4-aligned); the encoder stores addr>>2. Variable latency
     /// like ALD: set a `wr_barrier` and drain it before consuming the result.
-    pub fn ipa(self: *Assembler, dst: u8, addr: u16, c: Control) void {
+    pub fn ipa(self: *Assembler, dst: u8, addr: u16, ctl: Control) void {
         std.debug.assert(addr % 4 == 0);
         self.note(dst);
         const w = self.next();
         setBits(w, 0, 12, 0x326); // OpIpa
-        putPredTrue(w);
         setBits(w, 16, 8, dst); // dst
         setBits(w, 64, 8, addr >> 2); // attribute addr / 4
         setBits(w, 76, 2, 0); // loc = InterpLoc::Default
         setBits(w, 78, 2, 0); // freq = InterpFreq::Pass (implicit perspective)
         setBits(w, 32, 8, RZ); // offset reg src = RZ (required for Default loc)
         setBits(w, 81, 3, PT); // pred_dst = none (PT)
-        putControl(w, c);
-    }
-
-    /// EXIT - terminate the warp.
-    pub fn exit(self: *Assembler, c: Control) void {
-        const w = self.next();
-        setBits(w, 0, 12, 0x94d);
-        putPredTrue(w);
-        setBits(w, 87, 3, 7);
-        putControl(w, c);
+        putControl(w, ctl);
     }
 };
 
@@ -202,7 +707,15 @@ pub const Assembler = struct {
 /// 0x70; generic varyings / vertex inputs start at 0x80.
 pub const ATTR_POSITION: u16 = 0x70;
 pub const ATTR_GENERIC0: u16 = 0x80;
-/// System-value index for S2R: the vertex ID.
+
+/// System-value indices for `s2r`.
+pub const SR_LANE_ID: u8 = 0x00;
+pub const SR_TID_X: u8 = 0x21;
+pub const SR_TID_Y: u8 = 0x22;
+pub const SR_TID_Z: u8 = 0x23;
+pub const SR_CTAID_X: u8 = 0x25;
+pub const SR_CTAID_Y: u8 = 0x26;
+pub const SR_CTAID_Z: u8 = 0x27;
 pub const SR_VERTEX_ID: u8 = 0x2f;
 
 test "sass encodes the live-verified store kernel" {
@@ -232,6 +745,66 @@ test "sass encodes MOV register-to-register" {
     try std.testing.expectEqual(@as(u32, 1), (code[0] >> 9) & 0x7); // form 1 = reg src
     try std.testing.expectEqual(@as(u32, 0), (code[0] >> 16) & 0xff); // dst R0
     try std.testing.expectEqual(@as(u32, 4), code[1] & 0xff); // src R4 at bits 32..39
+}
+
+test "sass ALU forms follow the operand that is not a register" {
+    var code: [32]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    // All-register FFMA: form 1, with the third operand in the 64..71 slot.
+    a.ffma(4, Src.reg(1), Src.reg(2), Src.reg(3), .{});
+    try std.testing.expectEqual(@as(u32, 0x023), code[0] & 0x1ff);
+    try std.testing.expectEqual(@as(u32, 1), (code[0] >> 9) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (code[0] >> 24) & 0xff); // src0 R1
+    try std.testing.expectEqual(@as(u32, 2), code[1] & 0xff); // src1 R2
+    try std.testing.expectEqual(@as(u32, 3), code[2] & 0xff); // src2 R3
+    // An immediate third operand takes the 32..63 slot, pushing the second
+    // operand into the register slot at 64..71: form 2.
+    a.ffma(4, Src.reg(1), Src.reg(2), Src.float(1.0), .{});
+    try std.testing.expectEqual(@as(u32, 2), (code[4] >> 9) & 0x7);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), code[5]); // 1.0f
+    try std.testing.expectEqual(@as(u32, 2), code[6] & 0xff); // src1 moved to 64..71
+}
+
+test "sass IMAD tracks the wide destination pair in the register count" {
+    var code: [16]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.imadWide(6, Src.reg(0), Src.imm(4), Src.reg(2), false, .{});
+    try std.testing.expectEqual(@as(u32, 0x025), code[0] & 0x1ff);
+    try std.testing.expectEqual(@as(u32, 4), (code[0] >> 9) & 0x7); // form 4 = imm
+    // R6:R7 is written, so the kernel needs at least 8 registers.
+    try std.testing.expectEqual(@as(u32, 16), a.registerCount());
+}
+
+test "sass encodes a branch offset relative to the following instruction" {
+    var code: [32]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.movImm(0, 0, .{}); // instruction 0
+    const at = a.braForward(.{}); // instruction 1
+    a.movImm(1, 0, .{}); // instruction 2
+    a.exit(.{}); // instruction 3
+    a.patchBranch(at, 3);
+
+    const w = code[4..8];
+    try std.testing.expectEqual(@as(u32, 0x947), w[0] & 0xfff);
+    // Target 3 from branch 1: (3 - 1 - 1) * 4 = 4.
+    const low: u64 = (w[0] >> 16) & 0xff;
+    const high: u64 = @as(u64, (w[1] >> 2) | (@as(u64, w[2]) << 30)) & 0xffffffffffff;
+    try std.testing.expectEqual(@as(u64, 4), low | (high << 8));
+}
+
+test "sass encodes a backward branch as a negative offset" {
+    var code: [32]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.movImm(0, 0, .{}); // instruction 0
+    a.movImm(1, 0, .{}); // instruction 1
+    a.bra(0, .{ .pred = 0 }); // instruction 2, conditional on P0
+    const w = code[8..12];
+    // Target 0 from branch 2: (0 - 2 - 1) * 4 = -12, kept in 56 bits.
+    const low: u64 = (w[0] >> 16) & 0xff;
+    const high: u64 = @as(u64, (w[1] >> 2) | (@as(u64, w[2]) << 30)) & 0xffffffffffff;
+    try std.testing.expectEqual(signedBits(-12, 56), low | (high << 8));
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> 23) & 0x7); // condition P0
+    try std.testing.expectEqual(@as(u32, PT), (w[0] >> 12) & 0x7); // guard stays true
 }
 
 test "sass encodes IPA (interpolate attribute)" {
