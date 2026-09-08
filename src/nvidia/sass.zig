@@ -164,17 +164,125 @@ fn putControl(inst: []u32, c: Control) void {
     setBits(inst, 116, 6, c.wait_mask);
 }
 
+/// Cycles the scheduler leaves between a fixed-latency instruction and a reader
+/// of its result. Measured on Blackwell: a back-to-back dependent pair reads a
+/// stale register at a stall of 3 and the right value at 4, and IADD3, IMAD,
+/// SHF, SEL, MOV, FADD, FMUL and FFMA all behave the same way. A kernel with the
+/// full instruction mix needs 5, so this carries one more cycle of margin.
+/// Replacing it with a per-instruction table is the next step for performance.
+pub const ALU_LATENCY: u8 = 6;
+
+/// The same for a predicate result read by another instruction. Measured with an
+/// ISETP feeding a SEL: correct from a stall of 5.
+pub const PRED_LATENCY: u8 = 5;
+
+/// A branch reads its condition much later in the pipeline than an ALU reads a
+/// predicate. Measured with an ISETP feeding a BRA: the branch takes the stale
+/// predicate up to a stall of 12 and the new one from 13.
+pub const BRANCH_PRED_LATENCY: u8 = 13;
+
+/// The number of scoreboards the hardware gives each warp.
+pub const BARRIERS: u8 = 6;
+
+const NO_BARRIER: u8 = 0xff;
+
+/// What one instruction does to registers, recorded while it is emitted so
+/// `Assembler.schedule` can work out the stalls and scoreboards for the program.
+pub const Dep = struct {
+    /// GPRs written. Unused slots hold RZ.
+    writes: [4]u8 = .{ RZ, RZ, RZ, RZ },
+    /// GPRs read. Unused slots hold RZ.
+    reads: [6]u8 = .{ RZ, RZ, RZ, RZ, RZ, RZ },
+    /// Predicate written, and predicate read. PT means neither.
+    pred_write: u8 = PT,
+    pred_read: u8 = PT,
+    /// The result arrives at an unpredictable time, so a consumer has to wait on
+    /// a scoreboard instead of counting cycles.
+    variable: bool = false,
+    /// The instruction reads its sources after it issues (a memory op holding an
+    /// address), so an instruction that overwrites those sources must wait too.
+    late_read: bool = false,
+    /// Every outstanding scoreboard must drain before this instruction.
+    fence: bool = false,
+    /// Control leaves this instruction, so nothing after it is reachable in a
+    /// straight line.
+    branch: bool = false,
+    /// Control can arrive here from elsewhere.
+    target: bool = false,
+
+    /// Fills a `Dep` one operand at a time, so an emitter can describe itself
+    /// without counting array slots.
+    pub const Builder = struct {
+        dep: Dep = .{},
+        w: usize = 0,
+        r: usize = 0,
+
+        pub fn write(self: *Builder, reg: u8) void {
+            self.writeRun(reg, 1);
+        }
+        pub fn writeRun(self: *Builder, first: u8, count: u8) void {
+            if (first == RZ) return;
+            var i: u8 = 0;
+            while (i < count) : (i += 1) {
+                self.dep.writes[self.w] = first + i;
+                self.w += 1;
+            }
+        }
+        pub fn read(self: *Builder, reg: u8) void {
+            self.readRun(reg, 1);
+        }
+        pub fn readRun(self: *Builder, first: u8, count: u8) void {
+            if (first == RZ) return;
+            var i: u8 = 0;
+            while (i < count) : (i += 1) {
+                self.dep.reads[self.r] = first + i;
+                self.r += 1;
+            }
+        }
+        /// Read an ALU operand, which contributes nothing when it is a constant.
+        pub fn readSrc(self: *Builder, s: Src) void {
+            switch (s.ref) {
+                .reg => |reg| self.read(reg),
+                .imm => {},
+            }
+        }
+        pub fn readSrcRun(self: *Builder, s: Src, count: u8) void {
+            switch (s.ref) {
+                .reg => |reg| self.readRun(reg, count),
+                .imm => {},
+            }
+        }
+    };
+};
+
 /// Emits 128-bit SASS instructions into a caller-provided dword buffer (4 dwords
 /// per instruction). Tracks the highest GPR touched so the launch descriptor can
 /// derive a register count.
+///
+/// Give it a `deps` buffer of one entry per instruction to use `schedule`, which
+/// replaces every hand-written `Control` with stalls and scoreboards derived
+/// from the register traffic. Leave `deps` empty to keep full manual control.
 pub const Assembler = struct {
     code: []u32,
+    deps: []Dep = &.{},
     n: usize = 0, // dwords emitted
     max_reg: u8 = 0, // highest GPR index written/read (excluding RZ)
+
+    /// Record what the instruction just emitted does to registers.
+    fn dep(self: *Assembler, b: Dep.Builder) void {
+        if (self.deps.len == 0) return;
+        self.deps[self.n / 4 - 1] = b.dep;
+    }
 
     fn next(self: *Assembler) []u32 {
         const w = self.code[self.n..][0..4];
         @memset(w, 0);
+        if (self.deps.len != 0) {
+            // A branch can name its target before the target is emitted, so the
+            // reset keeps that mark.
+            const was_target = self.deps[self.n / 4].target;
+            self.deps[self.n / 4] = .{ .target = was_target };
+        }
         self.n += 4;
         return w;
     }
@@ -201,6 +309,201 @@ pub const Assembler = struct {
     pub fn registerCount(self: *const Assembler) u32 {
         const used = @as(u32, self.max_reg) + 1;
         return @max(16, (used + 7) & ~@as(u32, 7));
+    }
+
+    /// Rewrite every instruction's stall count and scoreboards from the register
+    /// traffic recorded during assembly. Call it once, after the last
+    /// instruction and before uploading the code.
+    ///
+    /// The model is a cycle counter. Each instruction issues as late as its
+    /// operands demand and no later, so instructions that depend on nothing
+    /// issue back to back at a stall of 1 instead of paying a fixed worst-case
+    /// delay. A result that arrives at an unpredictable time gets a scoreboard
+    /// instead of a delay, and the reader waits on it.
+    ///
+    /// Control flow is handled by draining: a branch and a branch target both
+    /// wait for every outstanding scoreboard, and a branch stalls long enough to
+    /// cover every fixed-latency result still in flight. That costs a few cycles
+    /// per loop and removes the need to reason about which path arrived.
+    pub fn schedule(self: *Assembler) error{OutOfBarriers}!void {
+        std.debug.assert(self.deps.len * 4 >= self.n);
+        const count = self.n / 4;
+        if (count == 0) return;
+
+        var reg_ready = [_]u32{0} ** 256; // cycle a GPR becomes readable
+        var pred_ready = [_]u32{0} ** 8; // when an ALU can read a predicate
+        var pred_ready_branch = [_]u32{0} ** 8; // when a branch can read it
+        var wr_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending write
+        var rd_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending read
+        var bar_used = [_]bool{false} ** BARRIERS;
+
+        var cycle: u32 = 0;
+        var prev_issue: u32 = 0;
+        var prev: usize = 0;
+        var have_prev = false;
+
+        for (0..count) |i| {
+            const d = self.deps[i];
+            var ctl = Control{};
+            var wait: u6 = 0;
+            var need = cycle;
+
+            // A branch or a target ends the straight line, so nothing may still
+            // be in flight across it.
+            if (d.target or d.branch or d.fence) {
+                for (bar_used, 0..) |used, b| {
+                    if (used) wait |= @as(u6, 1) << @intCast(b);
+                }
+            }
+            for (d.reads) |r| {
+                if (r == RZ) continue;
+                need = @max(need, reg_ready[r]);
+                if (wr_bar[r] != NO_BARRIER) wait |= @as(u6, 1) << @intCast(wr_bar[r]);
+            }
+            for (d.writes) |w| {
+                if (w == RZ) continue;
+                need = @max(need, reg_ready[w]); // write after read of an older value
+                if (wr_bar[w] != NO_BARRIER) wait |= @as(u6, 1) << @intCast(wr_bar[w]);
+                if (rd_bar[w] != NO_BARRIER) wait |= @as(u6, 1) << @intCast(rd_bar[w]);
+            }
+            if (d.pred_read != PT) {
+                const ready = if (d.branch) pred_ready_branch[d.pred_read] else pred_ready[d.pred_read];
+                need = @max(need, ready);
+            }
+            if (d.pred_write != PT) need = @max(need, pred_ready[d.pred_write]);
+
+            // Space the previous instruction so this one issues no earlier than
+            // `need`. The gap never exceeds the longest fixed latency, so the
+            // 4-bit stall field always holds it.
+            if (have_prev) {
+                const gap = need - prev_issue;
+                std.debug.assert(gap <= 15);
+                const stall: u4 = @intCast(@max(1, gap));
+                self.setStall(prev, stall);
+                cycle = prev_issue + stall;
+            }
+
+            releaseBarriers(wait, &bar_used, &wr_bar, &rd_bar);
+
+            if (d.variable and d.writes[0] != RZ) {
+                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar);
+                ctl.wr_barrier = @intCast(b);
+                for (d.writes) |w| {
+                    if (w == RZ) continue;
+                    wr_bar[w] = b;
+                    reg_ready[w] = cycle;
+                }
+            } else {
+                const latency: u32 = if (d.variable) 0 else ALU_LATENCY;
+                for (d.writes) |w| {
+                    if (w == RZ) continue;
+                    wr_bar[w] = NO_BARRIER;
+                    reg_ready[w] = cycle + latency;
+                }
+            }
+            if (d.late_read and self.writesAnyLater(i, d.reads)) {
+                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar);
+                ctl.rd_barrier = @intCast(b);
+                for (d.reads) |r| {
+                    if (r == RZ) continue;
+                    rd_bar[r] = b;
+                }
+            }
+            if (d.pred_write != PT) {
+                pred_ready[d.pred_write] = cycle + PRED_LATENCY;
+                pred_ready_branch[d.pred_write] = cycle + BRANCH_PRED_LATENCY;
+            }
+
+            ctl.wait_mask = wait;
+            ctl.pred = self.instrPred(i);
+            ctl.pred_not = self.instrPredNot(i);
+            self.setControl(i, ctl);
+
+            if (d.branch) {
+                // Give the branch a stall long enough that every fixed-latency
+                // result in flight has landed wherever control goes next.
+                var pending: u32 = 0;
+                for (reg_ready) |t| pending = @max(pending, t -| cycle);
+                for (pred_ready) |t| pending = @max(pending, t -| cycle);
+                for (pred_ready_branch) |t| pending = @max(pending, t -| cycle);
+                self.setStall(i, @intCast(@max(1, @min(15, pending))));
+                @memset(&reg_ready, 0);
+                @memset(&pred_ready, 0);
+                @memset(&pred_ready_branch, 0);
+                have_prev = false;
+                cycle = 0;
+                prev_issue = 0;
+                continue;
+            }
+
+            prev = i;
+            prev_issue = cycle;
+            have_prev = true;
+        }
+        // The last instruction has nothing after it to space out.
+        if (have_prev) self.setStall(prev, 1);
+    }
+
+    fn releaseBarriers(wait: u6, used: *[BARRIERS]bool, wr: *[256]u8, rd: *[256]u8) void {
+        for (0..BARRIERS) |b| {
+            if (wait & (@as(u6, 1) << @intCast(b)) == 0) continue;
+            used[b] = false;
+            for (wr) |*e| {
+                if (e.* == b) e.* = NO_BARRIER;
+            }
+            for (rd) |*e| {
+                if (e.* == b) e.* = NO_BARRIER;
+            }
+        }
+    }
+
+    /// Take a free scoreboard, waiting on the lowest-numbered one in use when
+    /// they are all taken.
+    fn takeBarrier(used: *[BARRIERS]bool, wait: *u6, wr: *[256]u8, rd: *[256]u8) error{OutOfBarriers}!u8 {
+        for (0..BARRIERS) |b| {
+            if (!used[b]) {
+                used[b] = true;
+                return @intCast(b);
+            }
+        }
+        for (0..BARRIERS) |b| {
+            const bit = @as(u6, 1) << @intCast(b);
+            if (wait.* & bit != 0) continue;
+            wait.* |= bit;
+            releaseBarriers(bit, used, wr, rd);
+            used[b] = true;
+            return @intCast(b);
+        }
+        return error.OutOfBarriers;
+    }
+
+    /// Whether a later instruction can overwrite one of `regs` while this one is
+    /// still reading them. Control flow makes the answer unknowable, so a branch
+    /// or a branch target ends the scan with a yes.
+    fn writesAnyLater(self: *const Assembler, i: usize, regs: [6]u8) bool {
+        var j = i + 1;
+        while (j < self.n / 4) : (j += 1) {
+            const d = self.deps[j];
+            for (regs) |g| {
+                if (g == RZ) continue;
+                for (d.writes) |w| if (w == g) return true;
+            }
+            if (d.branch or d.target) return true;
+        }
+        return false;
+    }
+
+    fn instrPred(self: *const Assembler, i: usize) u8 {
+        return @intCast((self.code[i * 4] >> 12) & 0x7);
+    }
+    fn instrPredNot(self: *const Assembler, i: usize) bool {
+        return (self.code[i * 4] >> 15) & 1 == 1;
+    }
+    fn setStall(self: *Assembler, i: usize, stall: u4) void {
+        setBits(self.code[i * 4 ..][0..4], 105, 4, stall);
+    }
+    fn setControl(self: *Assembler, i: usize, ctl: Control) void {
+        putControl(self.code[i * 4 ..][0..4], ctl);
     }
 
     // -----------------------------------------------------------------------
@@ -279,6 +582,10 @@ pub const Assembler = struct {
         const w = self.next();
         self.encodeAlu(w, 0x002, dst, null, src, null);
         setBits(w, 72, 4, 0xf); // all quad lanes
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(src);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -299,6 +606,12 @@ pub const Assembler = struct {
         self.encodeAlu(w, 0x007, dst, a, b, null);
         setBits(w, 87, 3, pred);
         setBits(w, 90, 1, @intFromBool(pred_not));
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.dep.pred_read = pred;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -343,6 +656,14 @@ pub const Assembler = struct {
         setBits(w, 80, 1, 1);
         setBits(w, 81, 3, carry_out);
         setBits(w, 84, 3, PT); // no second carry-out
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.readSrc(c);
+        dp.dep.pred_write = carry_out;
+        if (carry_in) |p| dp.dep.pred_read = p;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -357,6 +678,12 @@ pub const Assembler = struct {
         self.encodeAlu(w, 0x024, dst, a, b, c);
         setBits(w, 81, 3, PT); // no predicate destination
         setBits(w, 73, 1, @intFromBool(signed));
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.readSrc(c);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -375,6 +702,12 @@ pub const Assembler = struct {
         self.encodeAlu(w, 0x025, dst, a, b, c);
         setBits(w, 81, 3, PT);
         setBits(w, 73, 1, @intFromBool(signed));
+        var dp = Dep.Builder{};
+        dp.writeRun(dst, 2);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.readSrcRun(c, 2);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -390,6 +723,12 @@ pub const Assembler = struct {
         setBits(w, 81, 3, PT); // no predicate destination
         setBits(w, 87, 3, PT); // predicate input = false
         setBits(w, 90, 1, 1);
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.readSrc(c);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -402,6 +741,11 @@ pub const Assembler = struct {
         setBits(w, 75, 1, 0); // clamp the shift amount, do not wrap it
         setBits(w, 76, 1, 0); // left
         setBits(w, 80, 1, 0); // take the low half of the funnel
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(shift);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -414,6 +758,11 @@ pub const Assembler = struct {
         setBits(w, 75, 1, 0);
         setBits(w, 76, 1, 1); // right
         setBits(w, 80, 1, 1); // take the high half of the funnel
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(shift);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -431,6 +780,11 @@ pub const Assembler = struct {
         setBits(w, 76, 3, @intFromEnum(cmp));
         setBits(w, 81, 3, dst);
         setBits(w, 84, 3, PT); // no second destination
+        var dp = Dep.Builder{};
+        dp.dep.pred_write = dst;
+        dp.readSrc(a);
+        dp.readSrc(b);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -451,6 +805,11 @@ pub const Assembler = struct {
         setBits(w, 77, 1, 0); // no saturate
         setBits(w, 78, 2, 0); // round to nearest even
         setBits(w, 80, 1, 0); // no flush-to-zero
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -463,6 +822,11 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // round to nearest even
         setBits(w, 80, 1, 0); // no flush-to-zero
         setBits(w, 84, 3, 4); // no post-multiply divide
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -475,6 +839,12 @@ pub const Assembler = struct {
         setBits(w, 77, 1, 0); // no saturate
         setBits(w, 78, 2, 0); // round to nearest even
         setBits(w, 80, 1, 0); // no flush-to-zero
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.readSrc(a);
+        dp.readSrc(b);
+        dp.readSrc(c);
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -508,6 +878,12 @@ pub const Assembler = struct {
         setBits(w, 67, 1, 0);
         setBits(w, 81, 3, PT); // no predicate destination
         putGlobalAccess(w, mem_type, offset);
+        var dp = Dep.Builder{};
+        dp.writeRun(dst, mem_type.regs());
+        dp.readRun(addr, 2);
+        dp.dep.variable = true;
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -524,6 +900,11 @@ pub const Assembler = struct {
         setBits(w, 64, 8, URZ); // no uniform base register
         setBits(w, 72, 1, 1); // ... and it counts as 64-bit
         putGlobalAccess(w, mem_type, offset);
+        var dp = Dep.Builder{};
+        dp.readRun(addr, 2);
+        dp.readRun(data, mem_type.regs());
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -548,6 +929,12 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // address stride x1
         setBits(w, 87, 1, 0); // no predicate result
         setBits(w, 91, 1, 1);
+        var dp = Dep.Builder{};
+        dp.writeRun(dst, mem_type.regs());
+        dp.read(addr);
+        dp.dep.variable = true;
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -565,6 +952,11 @@ pub const Assembler = struct {
         setBits(w, 73, 3, @intFromEnum(mem_type));
         setBits(w, 78, 2, 0); // address stride x1
         setBits(w, 91, 1, 1);
+        var dp = Dep.Builder{};
+        dp.read(addr);
+        dp.readRun(data, mem_type.regs());
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -585,6 +977,12 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // indexed mode
         setBits(w, 80, 2, 0); // no texture-header unpack (sm >= 120)
         setBits(w, 91, 1, 0); // bound bank, not a bindless handle
+        var dp = Dep.Builder{};
+        dp.writeRun(dst, mem_type.regs());
+        dp.read(index);
+        dp.dep.variable = true;
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -596,6 +994,9 @@ pub const Assembler = struct {
         setBits(w, 72, 1, 0); // not MMIO
         setBits(w, 76, 3, @intFromEnum(scope));
         setBits(w, 80, 1, 0); // not the strong-cached form
+        var dp = Dep.Builder{};
+        dp.dep.fence = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -608,6 +1009,9 @@ pub const Assembler = struct {
     pub fn bar(self: *Assembler, ctl: Control) void {
         const w = self.next();
         setBits(w, 0, 12, 0xb1d);
+        var dp = Dep.Builder{};
+        dp.dep.fence = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -623,6 +1027,11 @@ pub const Assembler = struct {
     /// BRA target - branch to instruction index `target`. `ctl.pred` is the
     /// branch condition, so a non-PT predicate makes the branch conditional.
     pub fn bra(self: *Assembler, target: usize, ctl: Control) void {
+        self.emitBra(target, ctl);
+        self.markTarget(target);
+    }
+
+    fn emitBra(self: *Assembler, target: usize, ctl: Control) void {
         const from = self.here();
         const w = self.next();
         setBits(w, 0, 12, 0x947);
@@ -636,13 +1045,24 @@ pub const Assembler = struct {
         putControl(w, guard);
         setBits(w, 87, 3, ctl.pred);
         setBits(w, 90, 1, @intFromBool(ctl.pred_not));
+        var dp = Dep.Builder{};
+        dp.dep.branch = true;
+        dp.dep.pred_read = ctl.pred;
+        self.dep(dp);
+    }
+
+    /// Note that control can reach instruction `target` from somewhere else.
+    fn markTarget(self: *Assembler, target: usize) void {
+        if (self.deps.len == 0) return;
+        std.debug.assert(target < self.deps.len);
+        self.deps[target].target = true;
     }
 
     /// Emit a BRA whose target is not known yet, and return its instruction
     /// index. Call `patchBranch` with that index once the target is emitted.
     pub fn braForward(self: *Assembler, ctl: Control) usize {
         const at = self.here();
-        self.bra(at + 1, ctl); // provisional: fall through
+        self.emitBra(at + 1, ctl); // provisional: fall through
         return at;
     }
 
@@ -650,6 +1070,7 @@ pub const Assembler = struct {
     pub fn patchBranch(self: *Assembler, at: usize, target: usize) void {
         std.debug.assert(at * 4 < self.n);
         putBranchOffset(self.code[at * 4 ..][0..4], at, target);
+        self.markTarget(target);
     }
 
     /// EXIT - terminate the warp.
@@ -673,6 +1094,10 @@ pub const Assembler = struct {
         setBits(w, 0, 12, 0x919);
         setBits(w, 16, 8, dst);
         setBits(w, 72, 8, sysval);
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.dep.variable = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -687,6 +1112,10 @@ pub const Assembler = struct {
         setBits(w, 24, 8, RZ); // dynamic offset (RZ: static)
         setBits(w, 40, 10, addr);
         setBits(w, 74, 2, comps - 1);
+        var dp = Dep.Builder{};
+        dp.writeRun(dst, comps);
+        dp.dep.variable = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -701,6 +1130,10 @@ pub const Assembler = struct {
         setBits(w, 24, 8, RZ); // dynamic offset
         setBits(w, 40, 10, addr);
         setBits(w, 74, 2, comps - 1);
+        var dp = Dep.Builder{};
+        dp.readRun(data, comps);
+        dp.dep.late_read = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 
@@ -722,6 +1155,10 @@ pub const Assembler = struct {
         setBits(w, 78, 2, 0); // freq = InterpFreq::Pass (implicit perspective)
         setBits(w, 32, 8, RZ); // offset reg src = RZ (required for Default loc)
         setBits(w, 81, 3, PT); // pred_dst = none (PT)
+        var dp = Dep.Builder{};
+        dp.write(dst);
+        dp.dep.variable = true;
+        self.dep(dp);
         putControl(w, ctl);
     }
 };
@@ -867,4 +1304,92 @@ test "sass encodes a passthrough vertex shader (ald -> ast)" {
     try std.testing.expectEqual(@as(u32, ATTR_GENERIC0), (code[1] >> 8) & 0x3ff);
     // AST attribute addr = ATTR_POSITION
     try std.testing.expectEqual(@as(u32, ATTR_POSITION), (code[5] >> 8) & 0x3ff);
+}
+
+fn stallOf(code: []const u32, i: usize) u32 {
+    return (code[i * 4 + 3] >> 9) & 0xf;
+}
+fn wrBarrierOf(code: []const u32, i: usize) u32 {
+    return (code[i * 4 + 3] >> 14) & 0x7;
+}
+fn rdBarrierOf(code: []const u32, i: usize) u32 {
+    return (code[i * 4 + 3] >> 17) & 0x7;
+}
+fn waitMaskOf(code: []const u32, i: usize) u32 {
+    return (code[i * 4 + 3] >> 20) & 0x3f;
+}
+
+test "schedule packs independent instructions and spaces dependent ones" {
+    var code: [64]u32 = undefined;
+    var deps: [16]Dep = @splat(.{});
+    var a = Assembler{ .code = &code, .deps = &deps };
+    a.movImm(0, 1, .{});
+    a.movImm(1, 2, .{}); // reads nothing the first one wrote
+    a.iadd3(2, Src.reg(0), Src.reg(1), zero, .{}); // reads both
+    a.exit(.{});
+    try a.schedule();
+
+    // The second move depends on nothing, so it issues on the next cycle.
+    try std.testing.expectEqual(@as(u32, 1), stallOf(&code, 0));
+    // R1 is written at cycle 1 and readable at cycle 5, so the add waits.
+    try std.testing.expectEqual(@as(u32, ALU_LATENCY), stallOf(&code, 1));
+    // Nothing needs a scoreboard: every result here has a fixed latency.
+    try std.testing.expectEqual(@as(u32, 7), wrBarrierOf(&code, 0));
+    try std.testing.expectEqual(@as(u32, 0), waitMaskOf(&code, 2));
+}
+
+test "schedule gives a load a scoreboard and makes its reader wait" {
+    var code: [64]u32 = undefined;
+    var deps: [16]Dep = @splat(.{});
+    var a = Assembler{ .code = &code, .deps = &deps };
+    a.movImm(0, 0x1000, .{});
+    a.movImm(1, 0, .{});
+    a.ldg(4, 0, 0, .bits32, .{}); // instruction 2
+    a.stg(0, 4, 0, .bits32, .{}); // instruction 3 reads R4
+    a.exit(.{});
+    try a.schedule();
+
+    try std.testing.expectEqual(@as(u32, 0), wrBarrierOf(&code, 2));
+    try std.testing.expectEqual(@as(u32, 0b1), waitMaskOf(&code, 3));
+    // The store does not overwrite the address, so the load needs no read
+    // scoreboard.
+    try std.testing.expectEqual(@as(u32, 7), rdBarrierOf(&code, 2));
+}
+
+test "schedule guards a source that a later instruction overwrites" {
+    var code: [64]u32 = undefined;
+    var deps: [16]Dep = @splat(.{});
+    var a = Assembler{ .code = &code, .deps = &deps };
+    a.movImm(0, 0x1000, .{});
+    a.movImm(1, 0, .{});
+    a.ldg(4, 0, 0, .bits32, .{}); // instruction 2, address in R0:R1
+    a.iadd3(0, Src.reg(0), Src.imm(4), zero, .{}); // instruction 3 steps R0
+    a.exit(.{});
+    try a.schedule();
+
+    // The step must not overtake the load that still holds the address.
+    const rd = rdBarrierOf(&code, 2);
+    try std.testing.expect(rd != 7);
+    try std.testing.expect(waitMaskOf(&code, 3) & (@as(u32, 1) << @intCast(rd)) != 0);
+}
+
+test "schedule drains every scoreboard at a branch" {
+    var code: [64]u32 = undefined;
+    var deps: [16]Dep = @splat(.{});
+    var a = Assembler{ .code = &code, .deps = &deps };
+    a.movImm(0, 0x1000, .{});
+    a.movImm(1, 0, .{});
+    const loop = a.here();
+    a.ldg(4, 0, 0, .bits32, .{}); // instruction 2
+    a.isetp(0, .lt, true, Src.reg(4), Src.imm(9), .{}); // instruction 3
+    a.bra(loop, .{ .pred = 0 }); // instruction 4
+    a.exit(.{});
+    try a.schedule();
+
+    // The compare reads the loaded value, so it waits on the load's scoreboard,
+    // and the branch leaves nothing outstanding.
+    try std.testing.expectEqual(@as(u32, 0b1), waitMaskOf(&code, 3));
+    try std.testing.expect(deps[loop].target);
+    // The branch covers the predicate the compare produced.
+    try std.testing.expect(stallOf(&code, 3) >= PRED_LATENCY);
 }

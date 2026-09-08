@@ -853,6 +853,9 @@ test "live: SHF shifts a register left and right" {
 /// Shared memory holds A's tile at offset 0 and B's tile right after it, so the
 /// launch needs `2 * tile * tile * 4` bytes.
 ///
+/// The control fields are left to `Assembler.schedule`, so this reads as plain
+/// instructions with no scoreboard bookkeeping.
+///
 /// The staging code branches nowhere. A thread whose element is off the edge of
 /// A or B still loads (from a clamped address, so the read stays inside the
 /// matrix) and then selects a zero into the tile. Divergent branches around a
@@ -874,19 +877,19 @@ fn buildTiledMatmul(a: *sass.Assembler, comptime tile: u32) void {
     const tile_shift: u32 = @ctz(tile);
     const b_base: i32 = tile * tile * 4; // shared byte offset of B's tile
 
-    a.s2r(13, sass.SR_TID_X, .{ .wr_barrier = 0 });
-    a.s2r(14, sass.SR_TID_Y, .{ .wr_barrier = 1 });
-    a.s2r(16, sass.SR_CTAID_X, .{ .wr_barrier = 2 });
-    a.imad(9, Src.reg(16), Src.imm(tile), Src.reg(13), false, .{ .wait_mask = 0b101 }); // col
-    a.s2r(16, sass.SR_CTAID_Y, .{ .wr_barrier = 2 });
-    a.imad(8, Src.reg(16), Src.imm(tile), Src.reg(14), false, .{ .wait_mask = 0b110 }); // row
+    a.s2r(13, sass.SR_TID_X, .{});
+    a.s2r(14, sass.SR_TID_Y, .{});
+    a.s2r(16, sass.SR_CTAID_X, .{});
+    a.imad(9, Src.reg(16), Src.imm(tile), Src.reg(13), false, .{}); // col
+    a.s2r(16, sass.SR_CTAID_Y, .{});
+    a.imad(8, Src.reg(16), Src.imm(tile), Src.reg(14), false, .{}); // row
 
-    a.ldc(10, .{ .offset = mm_params.rows }, sass.RZ, .bits32, .{ .wr_barrier = 0 });
-    a.ldc(11, .{ .offset = mm_params.cols }, sass.RZ, .bits32, .{ .wr_barrier = 1 });
-    a.ldc(12, .{ .offset = mm_params.depth }, sass.RZ, .bits32, .{ .wr_barrier = 2 });
-    a.ldc(20, .{ .offset = mm_params.a_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 3 });
-    a.ldc(22, .{ .offset = mm_params.b_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 4 });
-    a.ldc(24, .{ .offset = mm_params.c_ptr }, sass.RZ, .bits64, .{ .wr_barrier = 5 });
+    a.ldc(10, .{ .offset = mm_params.rows }, sass.RZ, .bits32, .{});
+    a.ldc(11, .{ .offset = mm_params.cols }, sass.RZ, .bits32, .{});
+    a.ldc(12, .{ .offset = mm_params.depth }, sass.RZ, .bits32, .{});
+    a.ldc(20, .{ .offset = mm_params.a_ptr }, sass.RZ, .bits64, .{});
+    a.ldc(22, .{ .offset = mm_params.b_ptr }, sass.RZ, .bits64, .{});
+    a.ldc(24, .{ .offset = mm_params.c_ptr }, sass.RZ, .bits64, .{});
 
     // This thread's slot in the staged tile, and the row of A and column of B
     // it walks once the tile is staged.
@@ -899,7 +902,7 @@ fn buildTiledMatmul(a: *sass.Assembler, comptime tile: u32) void {
     a.movImm(4, 0, .{}); // accumulator
     a.movImm(5, 0, .{}); // tile index
     // Tile count = (K + tile - 1) / tile.
-    a.iadd3(34, Src.reg(12), Src.imm(tile - 1), zero, .{ .wait_mask = 0b000100 });
+    a.iadd3(34, Src.reg(12), Src.imm(tile - 1), zero, .{});
     a.shr(34, Src.reg(34), Src.imm(tile_shift), false, .{});
 
     const tile_loop = a.here();
@@ -908,25 +911,25 @@ fn buildTiledMatmul(a: *sass.Assembler, comptime tile: u32) void {
     // the clamped indices keep the address inside A either way.
     a.imad(29, Src.reg(5), Src.imm(tile), Src.reg(13), false, .{});
     a.isetp(0, .lt, true, Src.reg(29), Src.reg(12), .{});
-    a.isetp(1, .lt, true, Src.reg(8), Src.reg(10), .{ .wait_mask = 0b000001 });
+    a.isetp(1, .lt, true, Src.reg(8), Src.reg(10), .{});
     a.sel(28, Src.reg(29), zero, 0, false, .{});
     a.sel(17, Src.reg(8), zero, 1, false, .{});
     a.imad(16, Src.reg(17), Src.reg(12), Src.reg(28), false, .{});
-    a.imadWide(0, Src.reg(16), Src.imm(4), Src.reg(20), false, .{ .wait_mask = 0b001000 });
-    a.ldg(6, 0, 0, .bits32, .{ .wr_barrier = 0 });
-    a.sel(6, Src.reg(6), zero, 0, false, .{ .wait_mask = 0b000001 });
+    a.imadWide(0, Src.reg(16), Src.imm(4), Src.reg(20), false, .{});
+    a.ldg(6, 0, 0, .bits32, .{});
+    a.sel(6, Src.reg(6), zero, 0, false, .{});
     a.sel(6, Src.reg(6), zero, 1, false, .{});
 
     // Stage B[t*tile + ty][col] the same way.
     a.imad(29, Src.reg(5), Src.imm(tile), Src.reg(14), false, .{});
     a.isetp(0, .lt, true, Src.reg(29), Src.reg(12), .{});
-    a.isetp(1, .lt, true, Src.reg(9), Src.reg(11), .{ .wait_mask = 0b000010 });
+    a.isetp(1, .lt, true, Src.reg(9), Src.reg(11), .{});
     a.sel(28, Src.reg(29), zero, 0, false, .{});
     a.sel(17, Src.reg(9), zero, 1, false, .{});
     a.imad(16, Src.reg(28), Src.reg(11), Src.reg(17), false, .{});
-    a.imadWide(2, Src.reg(16), Src.imm(4), Src.reg(22), false, .{ .wait_mask = 0b010000 });
-    a.ldg(7, 2, 0, .bits32, .{ .wr_barrier = 1 });
-    a.sel(7, Src.reg(7), zero, 0, false, .{ .wait_mask = 0b000010 });
+    a.imadWide(2, Src.reg(16), Src.imm(4), Src.reg(22), false, .{});
+    a.ldg(7, 2, 0, .bits32, .{});
+    a.sel(7, Src.reg(7), zero, 0, false, .{});
     a.sel(7, Src.reg(7), zero, 1, false, .{});
 
     a.sts(27, 6, 0, .bits32, .{});
@@ -938,12 +941,12 @@ fn buildTiledMatmul(a: *sass.Assembler, comptime tile: u32) void {
     a.movReg(30, 18, .{});
     a.movReg(31, 19, .{});
     const inner_loop = a.here();
-    a.lds(32, 30, 0, .bits32, .{ .wr_barrier = 0, .rd_barrier = 2 });
-    a.lds(33, 31, 0, .bits32, .{ .wr_barrier = 1, .rd_barrier = 3 });
+    a.lds(32, 30, 0, .bits32, .{});
+    a.lds(33, 31, 0, .bits32, .{});
     // The pointer step must not overtake the load that still needs the address.
-    a.iadd3(30, Src.reg(30), Src.imm(4), zero, .{ .wait_mask = 0b001100 });
+    a.iadd3(30, Src.reg(30), Src.imm(4), zero, .{});
     a.iadd3(31, Src.reg(31), Src.imm(tile * 4), zero, .{});
-    a.ffma(4, Src.reg(32), Src.reg(33), Src.reg(4), .{ .wait_mask = 0b000011 });
+    a.ffma(4, Src.reg(32), Src.reg(33), Src.reg(4), .{});
     a.iadd3(26, Src.reg(26), Src.imm(1), zero, .{});
     a.isetp(0, .lt, true, Src.reg(26), Src.imm(tile), .{});
     a.bra(inner_loop, .{ .pred = 0 });
@@ -961,11 +964,11 @@ fn buildTiledMatmul(a: *sass.Assembler, comptime tile: u32) void {
     a.isetp(0, .ge, true, Src.reg(9), Src.reg(11), .{});
     const col_outside = a.braForward(.{ .pred = 0 });
     a.imad(16, Src.reg(8), Src.reg(11), Src.reg(9), false, .{});
-    a.imadWide(2, Src.reg(16), Src.imm(4), Src.reg(24), false, .{ .wait_mask = 0b100000 });
+    a.imadWide(2, Src.reg(16), Src.imm(4), Src.reg(24), false, .{});
     a.stg(2, 4, 0, .bits32, .{});
     a.patchBranch(row_outside, a.here());
     a.patchBranch(col_outside, a.here());
-    a.exit(.{ .stall = 1 });
+    a.exit(.{});
 }
 test "live: a tiled FP32 matmul kernel matches a CPU reference" {
     var r = try Runner.init();
@@ -998,8 +1001,10 @@ test "live: a tiled FP32 matmul kernel matches a CPU reference" {
     p[8] = depth;
 
     var code: [1024]u32 = undefined;
-    var a = sass.Assembler{ .code = &code };
+    var deps: [256]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
     buildTiledMatmul(&a, tile);
+    try a.schedule();
 
     try r.run(code[0..a.dwords()], .{
         .register_count = a.registerCount(),
@@ -1009,7 +1014,6 @@ test "live: a tiled FP32 matmul kernel matches a CPU reference" {
         .cbuf0_size = mm_params.size,
         .shared_mem_bytes = 2 * tile * tile * 4,
     });
-
     for (0..rows) |i| {
         for (0..cols) |j| {
             var want: f32 = 0;
