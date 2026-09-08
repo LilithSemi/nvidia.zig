@@ -21,6 +21,9 @@ const SET_SHADER_SHARED_MEMORY_WINDOW_A = 0x02a0; // + _B at 0x02a4
 const SEND_PCAS_A = 0x02b4;
 const SEND_SIGNALING_PCAS2_B = 0x02c0;
 const SET_SHADER_LOCAL_MEMORY_WINDOW_A = 0x07b0; // + _B at 0x07b4
+const INVALIDATE_SHADER_CACHES = 0x021c;
+// INSTRUCTION | LOCKS | FLUSH_DATA | DATA | CONSTANT
+const INVALIDATE_ALL_SHADER_CACHES: sdk.NvV32 = 0x1017;
 const PCAS_INVALIDATE_COPY_SCHEDULE = 3;
 const WFI = 0x0078; // host method, wait for engine idle
 
@@ -135,6 +138,14 @@ pub const Stream = struct {
         self.m1(SET_OBJECT, BLACKWELL_COMPUTE_B);
         self.mm(SET_SHADER_SHARED_MEMORY_WINDOW_A, &.{ 1, 0 }); // (1 << 32)
         self.mm(SET_SHADER_LOCAL_MEMORY_WINDOW_A, &.{ 0, 0xFF000000 }); // (0xff << 24)
+    }
+
+    /// Drop everything the SMs cached about the last program: its instructions,
+    /// its data, and its constants. A dispatch that reuses a program address for
+    /// new code needs this, or the SMs run the previous kernel out of the
+    /// instruction cache.
+    pub fn invalidateShaderCaches(self: *Stream) void {
+        self.m1(INVALIDATE_SHADER_CACHES, INVALIDATE_ALL_SHADER_CACHES);
     }
 
     /// Launch the QMD at `qmd_va` (256-byte aligned): point the work distributor
@@ -404,6 +415,7 @@ pub const Runner = struct {
 
         var s = Stream{ .buf = self.push.slice(u32) };
         s.setup();
+        s.invalidateShaderCaches();
         s.dispatch(self.descriptor.va);
         self.seq += 1;
         s.fence(self.sem.va, self.seq);
@@ -1004,5 +1016,28 @@ test "live: a tiled FP32 matmul kernel matches a CPU reference" {
             for (0..depth) |k| want += av[i * depth + k] * bv[k * cols + j];
             try std.testing.expectEqual(want, c_buf.read(f32, i * cols + j));
         }
+    }
+}
+
+test "live: a Runner reuses its channel for different kernels" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    // The second launch reuses the program address, so it only sees the new
+    // code if the dispatch invalidated the instruction cache.
+    for ([_]u8{ 1, 2, 3, 8 }) |n| {
+        var code: [512]u32 = undefined;
+        var a = sass.Assembler{ .code = &code };
+        a.movImm(0, @truncate(out.va), .{});
+        a.movImm(1, @intCast(out.va >> 32), .{});
+        a.movImm(2, 0, .{});
+        var i: u8 = 0;
+        while (i < n) : (i += 1) a.iadd3(2, sass.Src.reg(2), sass.Src.imm(1), sass.zero, .{});
+        a.stg(0, 2, 0, .bits32, .{});
+        a.exit(.{ .stall = 1 });
+        out.slice(u32)[0] = 0;
+        try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+        try std.testing.expectEqual(@as(u32, n), out.read(u32, 0));
     }
 }
