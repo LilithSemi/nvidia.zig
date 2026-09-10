@@ -1480,3 +1480,55 @@ test "schedule drains every scoreboard at a branch" {
     // The branch covers the predicate the compare produced.
     try std.testing.expect(stallOf(&code, 3) >= Latency.pred);
 }
+
+// The three encodings below were each a silent wrong-answer bug in another
+// implementation of this ISA (the vulcan compiler, on a 5070). None of them
+// faults when wrong; the kernel just computes something else. They are pinned
+// bit-for-bit here so a refactor cannot quietly reintroduce them.
+
+test "IADD3 marks its extended form at bit 74, not in the predicate field" {
+    var code: [16]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    // The carry-consuming half of a 64-bit add.
+    a.iadd3Carry(1, Src.reg(1), zero, zero, PT, 0, .{});
+    // Bit 74 is the .X flag. Reading the 87..89 predicate as the selector
+    // instead leaves this clear, and every 64-bit pointer add drops its carry.
+    try std.testing.expectEqual(@as(u32, 1), (code[2] >> 10) & 1);
+    try std.testing.expectEqual(@as(u32, 0), (code[2] >> 23) & 0x7); // carry-in P0
+    try std.testing.expectEqual(@as(u32, 0), (code[2] >> 26) & 1); // not inverted
+
+    // Without a carry-in the same field has to be clear, or an ordinary add
+    // picks up a carry that is not there.
+    a.iadd3(2, Src.reg(2), Src.imm(1), zero, .{});
+    try std.testing.expectEqual(@as(u32, 0), (code[6] >> 10) & 1);
+    try std.testing.expectEqual(@as(u32, PT), (code[6] >> 23) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (code[6] >> 26) & 1); // inverted, so false
+}
+
+test "LDG puts its uniform base at bit 32 where STG puts it at 64" {
+    var code: [16]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.ldg(4, 0, 0, .bits32, .{});
+    // The load's uniform base sits at 32..39. Putting it at 64 instead lands on
+    // the guard predicate field below and addresses through a stale register.
+    try std.testing.expectEqual(@as(u32, URZ), code[1] & 0xff);
+    try std.testing.expectEqual(@as(u32, 1), (code[2] >> 8) & 1); // 64-bit uniform
+
+    // The store really does use 64..71, so the two are not interchangeable.
+    a.stg(0, 4, 0, .bits32, .{});
+    try std.testing.expectEqual(@as(u32, URZ), code[6] & 0xff);
+    try std.testing.expectEqual(@as(u32, 1), (code[6] >> 8) & 1);
+    try std.testing.expectEqual(@as(u32, 4), code[5] & 0xff); // data register at 32..39
+}
+
+test "LDG encodes its guard predicate backwards and its predicate destination as PT" {
+    var code: [16]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.ldg(4, 0, 0, .bits32, .{});
+    // The guard at 64..66 counts down: an always-true guard is 0, not PT. Seven
+    // there names a real predicate register and the load runs conditionally.
+    try std.testing.expectEqual(@as(u32, 0), code[2] & 0x7);
+    try std.testing.expectEqual(@as(u32, 0), (code[2] >> 3) & 1); // not inverted
+    // The predicate destination is the ordinary way round, so it is PT for none.
+    try std.testing.expectEqual(@as(u32, PT), (code[2] >> 17) & 0x7);
+}
