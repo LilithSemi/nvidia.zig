@@ -2088,3 +2088,69 @@ test "live: batching dispatches costs far less per dispatch than submitting each
         return error.BatchingNoLongerPays;
     }
 }
+
+test "live: the FP32 multiply-add pipes reach their expected rate" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const Src = sass.Src;
+    const threads = 256;
+    const accs = 8; // independent chains, to cover the FFMA result latency
+    const rounds = 8; // unrolled groups per loop iteration
+    const trips = 1024;
+    const max_blocks = 2048;
+    const out = try r.alloc(.system, max_blocks * threads * 4);
+
+    var code: [2048]u32 = undefined;
+    var deps: [512]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    a.s2r(20, sass.SR_CTAID_X, .{});
+    a.s2r(21, sass.SR_TID_X, .{});
+    a.mov(10, Src.float(1.0), .{});
+    for (0..accs) |i| a.mov(@intCast(2 + i), Src.float(0.0), .{});
+    a.movImm(12, 0, .{});
+    const loop = a.here();
+    for (0..rounds) |_| {
+        for (0..accs) |i| {
+            const acc: u8 = @intCast(2 + i);
+            a.ffma(acc, Src.reg(acc), Src.reg(10), Src.reg(10), .{});
+        }
+    }
+    a.iadd3(12, Src.reg(12), Src.imm(1), sass.zero, .{});
+    a.isetp(0, .lt, true, Src.reg(12), Src.imm(trips), .{});
+    a.bra(loop, .{ .pred = 0 });
+    // One value per thread, so nothing can be optimised away by accident.
+    a.imad(22, Src.reg(20), Src.imm(threads), Src.reg(21), false, .{});
+    a.movImm(16, @truncate(out.va), .{});
+    a.movImm(17, @intCast(out.va >> 32), .{});
+    a.imadWide(0, Src.reg(22), Src.imm(4), Src.reg(16), false, .{});
+    a.stg(0, 2, 0, .bits32, .{});
+    a.exit(.{});
+    try a.schedule();
+
+    // Nothing here touches memory until the end, so this is the rate the
+    // multiply-add pipes can issue at: the denominator any kernel is measured
+    // against. Measured at about 22.7 TFLOP/s on the GB10 in September 2026.
+    const want: f32 = @floatFromInt(trips * rounds);
+    var best: f64 = 0;
+    for ([_]u32{ 512, 2048 }) |blocks| {
+        const g = Grid{
+            .register_count = a.registerCount(),
+            .grid = .{ blocks, 1, 1 },
+            .block = .{ threads, 1, 1 },
+        };
+        try r.run(code[0..a.dwords()], g); // warm
+        const t0 = monotonicNs();
+        try r.run(code[0..a.dwords()], g);
+        const ns = monotonicNs() - t0;
+        try std.testing.expectEqual(want, out.read(f32, 0));
+        try std.testing.expectEqual(want, out.read(f32, blocks * threads - 1));
+        const flops = @as(f64, @floatFromInt(blocks)) * threads * accs * rounds * trips * 2;
+        best = @max(best, flops / @as(f64, @floatFromInt(ns)));
+    }
+    // Well under the measured rate, so this catches a real collapse rather than
+    // ordinary variation or a slower part in the same family.
+    if (best < 10_000) {
+        std.debug.print("FP32 multiply-add rate fell to {d:.0} GFLOP/s\n", .{best});
+        return error.ArithmeticRateCollapsed;
+    }
+}
