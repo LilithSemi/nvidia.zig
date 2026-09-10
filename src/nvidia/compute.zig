@@ -2256,3 +2256,105 @@ test "live: a load keeps its address until it has read it, at high occupancy" {
         }
     }
 }
+
+/// One dependent pair, built with a chosen destination register and chosen
+/// extra sources for the consumer, so the register indices are the only thing
+/// that varies between measurements.
+const PairShape = struct {
+    dst: u8, // the register the producer writes and the consumer reads
+    src_b: u8, // the consumer's other sources, RZ for none
+    src_c: u8,
+    consumer_is_fma: bool,
+    producer_is_alu: bool = false,
+};
+
+fn runPair2(r: *Runner, out: Buffer, shape: PairShape, cdst: u8, stall: u4) !bool {
+    const Src = sass.Src;
+    var code: [256]u32 = undefined;
+    var a = sass.Assembler{ .code = &code };
+    a.movImm(0, @truncate(out.va), .{});
+    a.movImm(1, @intCast(out.va >> 32), .{});
+    a.movImm(shape.dst, 0x9999, .{}); // the stale value
+    if (shape.src_b != sass.RZ) a.movImm(shape.src_b, 1, .{});
+    if (shape.src_c != sass.RZ) a.movImm(shape.src_c, 0, .{});
+    // Producer, then consumer, with nothing in between.
+    if (shape.producer_is_alu) {
+        a.movImm(shape.src_b, 0x1234, .{});
+        a.iadd3(shape.dst, Src.reg(shape.src_b), Src.imm(0), sass.zero, .{ .stall = stall });
+    } else a.movImm(shape.dst, 0x1234, .{ .stall = stall });
+    if (shape.consumer_is_fma) {
+        a.imad(cdst, Src.reg(shape.dst), Src.reg(shape.src_b), Src.reg(shape.src_c), false, .{});
+    } else {
+        a.iadd3(cdst, Src.reg(shape.dst), Src.imm(0), sass.zero, .{});
+    }
+    a.stg(0, cdst, 0, .bits32, .{});
+    a.exit(.{});
+    out.slice(u32)[0] = 0;
+    try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+    return out.read(u32, 0) == 0x1234;
+}
+
+fn minPairStall2(r: *Runner, out: Buffer, shape: PairShape, cdst: u8) !u4 {
+    _ = try runPair2(r, out, shape, cdst, 15); // warm the program
+    var lo: u4 = 1;
+    var hi: u4 = 15;
+    while (lo < hi) {
+        const mid: u4 = lo + (hi - lo) / 2;
+        if (try runPair2(r, out, shape, cdst, mid)) hi = mid else lo = mid + 1;
+    }
+    return lo;
+}
+
+fn minPairStall(r: *Runner, out: Buffer, shape: PairShape) !u4 {
+    return minPairStall2(r, out, shape, 3);
+}
+
+test "live: only a cross-pipe result depends on which register carries it" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+
+    // Both ends on the integer pipe. The register the value travels in makes no
+    // difference here, so `same_pipe` needs no register-aware adjustment.
+    var reg: u8 = 4;
+    while (reg <= 19) : (reg += 1) {
+        if (reg == 12) continue; // the producer's own scratch
+        const stall = try minPairStall(&r, out, .{
+            .dst = reg,
+            .src_b = 12,
+            .src_c = sass.RZ,
+            .consumer_is_fma = false,
+            .producer_is_alu = true,
+        });
+        try std.testing.expectEqual(@as(u4, sass.Latency.same_pipe), stall);
+    }
+
+    // Crossing from the multiply pipe to the integer pipe, the cost alternates
+    // with bit 1 of the register: 5 cycles for R4, R5, R8, R9 and so on, 4 for
+    // R6, R7, R10, R11. `cross_pipe` is the worst of the two, so the table is
+    // safe everywhere and a cycle pessimistic on half the registers. An
+    // allocator that prefers a destination with bit 1 set gets that cycle back.
+    // Which register is cheap follows bit 1 of its index, but that pattern is
+    // not stable enough run to run to pin here. What matters to the scheduler
+    // is asserted instead: nothing ever needs more than `cross_pipe`, and the
+    // variation is real rather than the constant being pure padding.
+    var saw_worst = false;
+    var saw_cheap = false;
+    reg = 4;
+    while (reg <= 19) : (reg += 1) {
+        const stall = try minPairStall(&r, out, .{
+            .dst = reg,
+            .src_b = sass.RZ,
+            .src_c = sass.RZ,
+            .consumer_is_fma = false,
+        });
+        if (stall > sass.Latency.cross_pipe) {
+            std.debug.print("cross-pipe through R{d} needed {d} cycles\n", .{ reg, stall });
+            return error.CrossPipeLatencyExceeded;
+        }
+        if (stall == sass.Latency.cross_pipe) saw_worst = true;
+        if (stall <= sass.Latency.same_pipe) saw_cheap = true;
+    }
+    try std.testing.expect(saw_worst);
+    try std.testing.expect(saw_cheap);
+}
