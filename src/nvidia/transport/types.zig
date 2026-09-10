@@ -9,7 +9,7 @@ const sdk = @import("../sdk.zig");
 /// OpenFailed / NoDevice mean "couldn't get into the device" (skip-worthy in
 /// tests); IoctlFailed / RmAllocFailed mean an operation failed on a reachable
 /// device (a real error). NotImplemented is returned by the freestanding stub.
-pub const Error = error{ OpenFailed, IoctlFailed, BadVersion, RmAllocFailed, NoDevice, MapFailed, ControlFailed, NotImplemented };
+pub const Error = error{ OpenFailed, IoctlFailed, BadVersion, RmAllocFailed, NoDevice, MapFailed, ControlFailed, NotImplemented, ReservedGpuAddress };
 
 pub const control_device = "/dev/nvidiactl";
 

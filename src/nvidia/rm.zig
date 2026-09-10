@@ -226,11 +226,34 @@ pub const Client = struct {
         return self.t.rmAlloc(dev.client, dev.device, self.t.newHandle(), sdk.FERMI_VASPACE_A, &params, @sizeOf(sdk.VaSpaceAllocParams));
     }
 
+    /// A span of GPU virtual address space the driver keeps for itself, and the
+    /// worst kind of trap: a map inside it usually succeeds, and then every
+    /// store to it disappears. No error, no fault, the writes simply never land.
+    /// One address in it, 0x1_0000_0000, is refused outright instead.
+    ///
+    /// Measured on this driver: 0xFE00_0000 works, 0xFF00_0000 through
+    /// 0x1_FFF0_0000 all swallow stores, and 0x2_0000_0000 works again. The
+    /// bound below sits one measured-good step under the lowest address seen to
+    /// fail. A vulcan session hit the same window independently and put its
+    /// start at 0xFFE0_0000, so treat the exact edge as driver-dependent and
+    /// keep the guard conservative.
+    pub const RESERVED_VA_START: u64 = 0xFE00_0000;
+    pub const RESERVED_VA_END: u64 = 0x2_0000_0000;
+
+    /// Whether [`va`, `va + size`) touches the span the driver keeps.
+    pub fn vaIsReserved(va: u64, size: u64) bool {
+        return va < RESERVED_VA_END and va + size > RESERVED_VA_START;
+    }
+
     /// Bind a physical memory object into `vaspace` at GPU virtual address
     /// `gpu_va`, so the GPU can address it (e.g. a channel's GPFIFO/pushbuffer).
     /// Carves an NV01_MEMORY_VIRTUAL range then RM_MAP_MEMORY_DMA with a fixed
     /// offset (dmaOffset is an input for a virtual hDma; VA 0 is reserved).
+    ///
+    /// Refuses an address in the driver's reserved span rather than handing back
+    /// a mapping that silently drops every write.
     pub fn mapToGpu(self: *Client, dev: Device, vaspace: sdk.NvHandle, mem: Memory, gpu_va: u64) Error!GpuMapping {
+        if (vaIsReserved(gpu_va, mem.size)) return error.ReservedGpuAddress;
         return self.t.mapToGpu(dev, vaspace, mem, gpu_va);
     }
 
@@ -238,6 +261,7 @@ pub const Client = struct {
     /// Block-linear PTE kinds are only valid on big pages; a small-page map faults
     /// the depth draw (Xid 69 / ErrorCode 0x9c). `gpu_va` should be big-page aligned.
     pub fn mapToGpuBig(self: *Client, dev: Device, vaspace: sdk.NvHandle, mem: Memory, gpu_va: u64) Error!GpuMapping {
+        if (vaIsReserved(gpu_va, mem.size)) return error.ReservedGpuAddress;
         return self.t.mapToGpuPaged(dev, vaspace, mem, gpu_va, sdk.dma_flags.PAGE_SIZE_BIG);
     }
 

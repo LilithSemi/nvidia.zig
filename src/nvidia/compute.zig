@@ -529,6 +529,10 @@ pub const Runner = struct {
     }
 
     fn takeVa(self: *Runner, size: u64) u64 {
+        // Step over the span the driver keeps for itself. A mapping in there
+        // succeeds and then swallows every store, so the allocator must never
+        // hand one out.
+        if (rm.Client.vaIsReserved(self.next_va, size)) self.next_va = rm.Client.RESERVED_VA_END;
         const va = self.next_va;
         self.next_va += std.mem.alignForward(u64, size, VA_STEP);
         return va;
@@ -2153,4 +2157,52 @@ test "live: the FP32 multiply-add pipes reach their expected rate" {
         std.debug.print("FP32 multiply-add rate fell to {d:.0} GFLOP/s\n", .{best});
         return error.ArithmeticRateCollapsed;
     }
+}
+
+test "live: a mapping in the driver's reserved span is refused, not silently dead" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const mem = try r.client.allocMemory(r.dev, .system, 0x1000);
+
+    // Inside the span, at both edges and in the middle.
+    for ([_]u64{ 0xFF00_0000, 0x1_0000_0000, 0x1_FFF0_0000 }) |va| {
+        try std.testing.expectError(
+            error.ReservedGpuAddress,
+            r.client.mapToGpu(r.dev, r.vaspace, mem, va),
+        );
+    }
+    // A range that only overlaps the start of the span is refused too.
+    try std.testing.expectError(
+        error.ReservedGpuAddress,
+        r.client.mapToGpu(r.dev, r.vaspace, mem, rm.Client.RESERVED_VA_START - 0x800),
+    );
+    // Either side of it is fine, and a store there actually lands.
+    for ([_]u64{ 0xF000_0000, rm.Client.RESERVED_VA_END }) |va| {
+        r.next_va = va;
+        const buf = try r.alloc(.system, 0x1000);
+        try std.testing.expectEqual(va, buf.va);
+        var code: [128]u32 = undefined;
+        var deps: [32]sass.Dep = @splat(.{});
+        var a = sass.Assembler{ .code = &code, .deps = &deps };
+        a.movImm(0, @truncate(buf.va), .{});
+        a.movImm(1, @intCast(buf.va >> 32), .{});
+        a.movImm(2, 0xabcd, .{});
+        a.stg(0, 2, 0, .bits32, .{});
+        a.exit(.{});
+        try a.schedule();
+        try r.run(code[0..a.dwords()], .{ .register_count = a.registerCount() });
+        try std.testing.expectEqual(@as(u32, 0xabcd), buf.read(u32, 0));
+    }
+}
+
+test "the address allocator steps over the driver's reserved span" {
+    // Walk the bump allocator up to the span and check it lands past the end
+    // rather than inside, where stores would vanish.
+    var next: u64 = rm.Client.RESERVED_VA_START - 0x20_0000;
+    try std.testing.expect(!rm.Client.vaIsReserved(next, 0x1000));
+    next += 0x20_0000;
+    try std.testing.expect(rm.Client.vaIsReserved(next, 0x1000));
+    if (rm.Client.vaIsReserved(next, 0x1000)) next = rm.Client.RESERVED_VA_END;
+    try std.testing.expectEqual(rm.Client.RESERVED_VA_END, next);
+    try std.testing.expect(!rm.Client.vaIsReserved(next, 0x1000));
 }
