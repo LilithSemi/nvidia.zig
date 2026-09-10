@@ -1306,9 +1306,14 @@ const Probe = enum {
     }
 };
 
-/// Every thread runs the same probe and stores its own answer, so the timing is
-/// measured at the occupancy a real kernel runs at rather than with one warp.
-const probe_threads = 256;
+/// Every thread runs the same probe and stores its own answer.
+///
+/// One warp, deliberately. At 256 threads two of the probes below measure a
+/// cycle less than they do here, because while one warp waits the scheduler
+/// issues from another and a stall that is one cycle short never shows. That
+/// makes a high-occupancy measurement an average rather than a floor, and a
+/// scheduler needs the floor. Credit to a vulcan session for the hypothesis.
+const probe_threads = 32;
 
 fn buildProbe(a: *sass.Assembler, p: Probe, stall: u4, out_va: u64, in_va: u64) void {
     const Src = sass.Src;

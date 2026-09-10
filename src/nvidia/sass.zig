@@ -198,13 +198,17 @@ pub const Latency = struct {
 
     /// Cycles the scheduler adds on top of every measured figure above.
     ///
-    /// The figures are measured with one dependency at a time. A whole kernel
-    /// adds effects this model does not carry, register bank conflicts among
-    /// them, and a tiled matmul run while the desktop is also using the GPU
-    /// fails about one run in ten with no margin and none in ten with it. Model
-    /// those effects and this can go to zero; until then a dependent reader
-    /// waits one cycle longer than the hardware strictly needs. Instructions
-    /// that depend on nothing are unaffected: they still issue back to back.
+    /// The figures are measured one dependency at a time, at one warp so that no
+    /// other warp can hide a shortfall. Two things are known to sit outside that
+    /// model. Register banking: a cross-pipe result costs a cycle less through
+    /// half the registers, which makes `cross_pipe` the worst case and safe
+    /// rather than short. And something in dense code that neither banking nor
+    /// occupancy explains, which an unrolled matmul inner loop reproduces and
+    /// which no single-instruction analysis has localised.
+    ///
+    /// So this is not padding against a known effect, it is honesty about an
+    /// unknown one. Instructions that depend on nothing are unaffected: they
+    /// still issue back to back.
     pub const margin: u8 = 1;
 };
 
