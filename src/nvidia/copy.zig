@@ -43,6 +43,7 @@ const SET_SRC_ORIGIN = 0x073C; // packed { x: 15:0, y: 31:16 }
 const DATA_TRANSFER_TYPE_NON_PIPELINED: u32 = 0x2; // 1:0
 const FLUSH_ENABLE_TRUE: u32 = 1 << 2; // 2:2
 const SRC_MEMORY_LAYOUT_BLOCKLINEAR: u32 = 0 << 7; // 7:7
+const SRC_MEMORY_LAYOUT_PITCH: u32 = 1 << 7;
 const DST_MEMORY_LAYOUT_PITCH: u32 = 1 << 8; // 8:8
 const MULTI_LINE_ENABLE_TRUE: u32 = 1 << 9; // 9:9
 const SEMAPHORE_TYPE_RELEASE_ONE_WORD: u32 = 1 << 3; // 4:3: release a 1-word semaphore
@@ -53,6 +54,19 @@ const GOB_HEIGHT_FERMI_8: u32 = 1 << 12;
 const KIND_BPP_BL_32: u32 = 0 << 16; // TuringColor2D (Blackwell >=4-byte color)
 
 const GOB_WIDTH_BYTES: u32 = 64;
+
+/// A plain linear copy: `bytes` from `src_va` to `dst_va`, no tiling on either
+/// side. This is the copy engine's side of the small-transfer question, against
+/// which `compute.Stream.uploadInline` is measured.
+pub const Linear = struct {
+    src_va: u64,
+    dst_va: u64,
+    bytes: u32,
+    // As in `Detile`: the CE has no host WFI fence, so it releases its own
+    // semaphore when the transfer has flushed through L2.
+    sem_va: u64 = 0,
+    sem_seq: u32 = 0,
+};
 
 /// Parameters for a block-linear -> pitch detile copy of an A8R8G8B8 (4 byte/px)
 /// color surface. The src tiling matches the block-linear color render targets
@@ -148,6 +162,28 @@ pub const Stream = struct {
 
         var launch = DATA_TRANSFER_TYPE_NON_PIPELINED | FLUSH_ENABLE_TRUE |
             SRC_MEMORY_LAYOUT_BLOCKLINEAR | DST_MEMORY_LAYOUT_PITCH | MULTI_LINE_ENABLE_TRUE;
+        if (d.sem_va != 0) launch |= SEMAPHORE_TYPE_RELEASE_ONE_WORD;
+        self.m1(LAUNCH_DMA, launch);
+    }
+
+    /// Emit one linear copy. A single line of `bytes`, so the pitches carry no
+    /// meaning and multi-line addressing stays off.
+    pub fn linear(self: *Stream, d: Linear) void {
+        if (d.sem_va != 0) {
+            self.mm(SET_SEMAPHORE_A, &.{
+                @intCast((d.sem_va >> 32) & 0x1ffff),
+                @truncate(d.sem_va),
+                d.sem_seq,
+            });
+        }
+        self.mm(OFFSET_IN_UPPER, &.{
+            @intCast(d.src_va >> 32), @truncate(d.src_va),
+            @intCast(d.dst_va >> 32), @truncate(d.dst_va),
+            d.bytes,                  d.bytes,
+            d.bytes,                  1,
+        }); // OFFSET_IN/OUT, PITCH_IN/OUT, LINE_LENGTH_IN, LINE_COUNT
+        var launch = DATA_TRANSFER_TYPE_NON_PIPELINED | FLUSH_ENABLE_TRUE |
+            SRC_MEMORY_LAYOUT_PITCH | DST_MEMORY_LAYOUT_PITCH;
         if (d.sem_va != 0) launch |= SEMAPHORE_TYPE_RELEASE_ONE_WORD;
         self.m1(LAUNCH_DMA, launch);
     }

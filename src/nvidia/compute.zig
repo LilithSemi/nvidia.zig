@@ -211,6 +211,7 @@ pub const Stream = struct {
     }
 };
 
+const copy = @import("copy.zig");
 const rm = @import("rm.zig");
 const sass = @import("sass.zig");
 
@@ -337,6 +338,16 @@ pub const Runner = struct {
     descriptor: Buffer,
     push: Buffer,
     sem: Buffer,
+    /// A second channel on the copy engine, brought up only when something asks
+    /// for a copy. The copy engine has its own runlist, so it cannot share the
+    /// compute channel; keeping both here lets one test time the two paths
+    /// against each other.
+    copy_channel: ?rm.Channel = null,
+    copy_queue: rm.Queue = undefined,
+    copy_push: Buffer = undefined,
+    copy_sem: Buffer = undefined,
+    copy_seq: u32 = 0,
+    doorbell: []u8 = &.{},
 
     /// Where the bump allocator starts, and the step between allocations. One
     /// 2 MB step per buffer keeps every allocation on its own big page.
@@ -408,6 +419,7 @@ pub const Runner = struct {
         });
 
         self.channel = ch;
+        self.doorbell = door.bytes;
         self.queue = .{
             .channel = ch,
             .token = token,
@@ -416,6 +428,67 @@ pub const Runner = struct {
             .doorbell = door.bytes,
         };
         return self;
+    }
+
+    /// Bring up the copy-engine channel on first use. It needs its own ring,
+    /// USERD, pushbuffer and semaphore, but shares the VA space and the doorbell
+    /// page with the compute channel.
+    fn ensureCopyChannel(self: *Runner) !void {
+        if (self.copy_channel != null) return;
+        const gpfifo = try self.client.allocMemory(self.dev, .vram, GPFIFO_BYTES);
+        const gpfifo_va = self.takeVa(GPFIFO_BYTES);
+        _ = try self.client.mapToGpu(self.dev, self.vaspace, gpfifo, gpfifo_va);
+        const gpfifo_cpu = try self.client.mapMemory(self.dev, gpfifo);
+        const userd = try self.client.allocMemory(self.dev, .vram, 0x1000);
+        const userd_cpu = try self.client.mapMemory(self.dev, userd);
+        self.copy_push = try self.alloc(.system, 0x1000);
+        self.copy_sem = try self.alloc(.system, 0x1000);
+
+        const ch = try self.client.allocChannelEngine(
+            self.dev,
+            sdk.BLACKWELL_CHANNEL_GPFIFO_B,
+            self.vaspace,
+            gpfifo_va,
+            GPFIFO_ENTRIES,
+            userd,
+            sdk.NV2080_ENGINE_TYPE_COPY0,
+        );
+        _ = try self.client.allocObject(self.dev, ch, sdk.BLACKWELL_DMA_COPY_B);
+        try self.client.bindChannel(self.dev, ch, sdk.NV2080_ENGINE_TYPE_COPY0);
+        try self.client.scheduleChannel(self.dev, ch, true);
+        const token = try self.client.workSubmitToken(self.dev, ch);
+        self.copy_channel = ch;
+        self.copy_queue = .{
+            .channel = ch,
+            .token = token,
+            .userd = userd_cpu.bytes,
+            .gpfifo = gpfifo_cpu.bytes,
+            .doorbell = self.doorbell,
+        };
+    }
+
+    /// Copy `bytes` from `src_va` to `dst_va` on the copy engine and wait for the
+    /// engine's own semaphore to land.
+    pub fn copyLinear(self: *Runner, dst_va: u64, src_va: u64, bytes: u32) !void {
+        try self.ensureCopyChannel();
+        self.copy_seq += 1;
+        var s = copy.Stream{ .buf = self.copy_push.slice(u32) };
+        s.setup();
+        s.linear(.{
+            .src_va = src_va,
+            .dst_va = dst_va,
+            .bytes = bytes,
+            .sem_va = self.copy_sem.va,
+            .sem_seq = self.copy_seq,
+        });
+        const semp: *volatile u32 = @ptrCast(@alignCast(self.copy_sem.bytes.ptr));
+        semp.* = 0;
+        self.copy_queue.submit(self.copy_push.va, s.dwords());
+        var spins: u64 = 0;
+        while (spins < SPIN_LIMIT) : (spins += 1) {
+            if (semp.* == self.copy_seq) return;
+        }
+        return error.CopyTimeout;
     }
 
     pub fn deinit(self: *Runner) void {
@@ -1784,4 +1857,16 @@ test "live: an inline upload lands in memory without a source buffer" {
     @memset(dst.slice(u32)[0..long.len], 0);
     try r.uploadInline(dst.va, long);
     for (long, 0..) |want, i| try std.testing.expectEqual(want, dst.read(u32, i));
+}
+
+test "live: a linear copy on the copy engine moves a buffer" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const src = try r.alloc(.system, 0x4000);
+    const dst = try r.alloc(.system, 0x4000);
+    const sv = src.slice(u32);
+    for (sv[0..1024], 0..) |*w, i| w.* = @intCast(0x1234_0000 + i);
+
+    try r.copyLinear(dst.va, src.va, 1024 * 4);
+    for (0..1024) |i| try std.testing.expectEqual(sv[i], dst.read(u32, i));
 }
