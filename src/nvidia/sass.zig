@@ -214,13 +214,29 @@ pub const Latency = struct {
     /// one tile is correct; one block with two tiles is wrong. Four blocks with
     /// one tile are correct, so it is not about blocks. Sizes that are exact
     /// multiples of the tile fail too, so it is not the boundary guards, and the
-    /// guards are predicated rather than branched anyway. The wrong answers are
-    /// whole rows of the staged tile and they move between runs, so it is a race
-    /// rather than a short dependency. Ruled out by measurement: register
-    /// banking, the latency table being an average, scoreboard pressure (one
-    /// pair in flight fails the same as four), shared memory visibility at
-    /// either barrier (a CTA membar on both sides changes nothing), and code
-    /// layout, since a stall bump moves no instruction bytes at all.
+    /// guards are predicated rather than branched anyway.
+    ///
+    /// It is not probabilistic, which is easy to misread from the symptom. The
+    /// unrolled kernel is wrong on every run at the shapes that trigger it, and
+    /// the looped one is right on every run at those same shapes, 225 of them
+    /// across a threefold stretch of the tile walk. What moves between runs is
+    /// only which rows of the staged tile lose. So the defect is present in one
+    /// version and absent in the other; it is not one defect that the slower
+    /// version keeps winning against.
+    ///
+    /// Ruled out by measurement, not by argument: register banking, the latency
+    /// table being an average, scoreboard pressure (one load pair in flight
+    /// fails the same as four), shared memory visibility at either barrier (a
+    /// CTA membar on both sides changes nothing), outstanding shared loads at
+    /// the barrier (every load is already waited on by name where its value is
+    /// used, and forcing the fence to drain all six scoreboards changes
+    /// nothing), the barrier's predicate source at bits 87..90, and code layout,
+    /// since a stall bump moves no instruction bytes at all.
+    ///
+    /// The one structural difference left: the looped inner loop leaves P0
+    /// uniformly false at the second barrier, because that is the condition that
+    /// ended it. The unrolled version leaves whatever the staging guard put
+    /// there, which is divergent at some shapes.
     ///
     /// Instructions that depend on nothing are unaffected: they still issue back
     /// to back.
