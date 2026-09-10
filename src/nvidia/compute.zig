@@ -382,6 +382,9 @@ pub const Runner = struct {
     const VA_BASE: u64 = 0x1000_0000;
     const VA_STEP: u64 = 0x20_0000;
     const CODE_BYTES = 0x1000; // matches the QMD's 4 KB program prefetch
+    /// How many launch descriptors the batch area holds, and so the most
+    /// dispatches one submission can carry.
+    pub const MAX_BATCH = 64;
     // Big enough for a sizeable inline upload: the payload rides in here.
     const PUSH_BYTES = 0x20000;
     const GPFIFO_BYTES = 0x2000;
@@ -422,7 +425,7 @@ pub const Runner = struct {
 
         // Code and descriptor are write-combined: the CPU only writes them.
         self.code = try self.alloc(.system_wc, CODE_BYTES);
-        self.descriptor = try self.alloc(.system_wc, QMD_DWORDS * 4);
+        self.descriptor = try self.alloc(.system_wc, MAX_BATCH * QMD_DWORDS * 4);
         self.push = try self.alloc(.system, PUSH_BYTES);
         self.sem = try self.alloc(.system, 0x1000);
 
@@ -570,19 +573,45 @@ pub const Runner = struct {
     /// in here. A grid that never signals gives `error.GridTimeout`, which means
     /// the kernel hung or faulted.
     pub fn run(self: *Runner, code: []const u32, g: Grid) !void {
+        return self.runBatch(code, &.{g});
+    }
+
+    /// Dispatch every grid in `grids` from one pushbuffer, with one ring of the
+    /// doorbell and one fence at the end. All of them run the same program.
+    ///
+    /// The grids are not ordered against each other: the work distributor may
+    /// overlap them, so they must not write the same memory. What they save is
+    /// the per-submission cost, which is most of what a small kernel costs.
+    ///
+    /// Measured on the GB10 in September 2026, nanoseconds per dispatch:
+    ///
+    ///     dispatches | batched | one at a time
+    ///              1 |   19711 |         19569
+    ///              4 |    9084 |         19598
+    ///             16 |    6663 |         19596
+    ///             64 |    6228 |         19901
+    ///
+    /// A dispatch on its own costs about 19.6 us however many there are. In a
+    /// batch that falls to about 6.2 us, so roughly two thirds of a small
+    /// launch is the submission round trip rather than the launch itself.
+    pub fn runBatch(self: *Runner, code: []const u32, grids: []const Grid) !void {
         std.debug.assert(code.len * 4 <= self.code.bytes.len);
+        std.debug.assert(grids.len > 0 and grids.len <= MAX_BATCH);
         @memcpy(self.code.slice(u32)[0..code.len], code);
 
-        var grid = g;
-        grid.prog_va = self.code.va;
-        var qmd: [QMD_DWORDS]u32 = undefined;
-        buildQmd(&qmd, grid);
-        @memcpy(self.descriptor.slice(u32)[0..QMD_DWORDS], &qmd);
+        const descriptors = self.descriptor.slice(u32);
+        for (grids, 0..) |g, i| {
+            var grid = g;
+            grid.prog_va = self.code.va;
+            var qmd: [QMD_DWORDS]u32 = undefined;
+            buildQmd(&qmd, grid);
+            @memcpy(descriptors[i * QMD_DWORDS ..][0..QMD_DWORDS], &qmd);
+        }
 
         var s = Stream{ .buf = self.push.slice(u32) };
         s.setup();
         s.invalidateShaderCaches();
-        s.dispatch(self.descriptor.va);
+        for (0..grids.len) |i| s.dispatch(self.descriptor.va + i * QMD_DWORDS * 4);
         self.seq += 1;
         s.fence(self.sem.va, self.seq);
         return self.submitAndWait(s.dwords());
@@ -1956,4 +1985,106 @@ test "live: the inline path costs more per byte than the copy engine" {
     // And the constant has to sit where the measurement puts it.
     try std.testing.expect(preferInlineUpload(small));
     try std.testing.expect(!preferInlineUpload(big));
+}
+
+test "live: one submission carries a batch of dispatches" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const params = try r.alloc(.system, 0x4000);
+    const batch = 16;
+    const stride = 256; // constant banks bind on a 64-byte boundary
+    const Src = sass.Src;
+
+    // Every dispatch runs the same program but binds its own constant bank, so
+    // each one writes a different slot and they never touch the same memory.
+    for (0..batch) |i| params.slice(u32)[i * stride / 4] = @intCast(i);
+
+    var code: [256]u32 = undefined;
+    var deps: [64]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    a.ldc(2, .{ .offset = 0 }, sass.RZ, .bits32, .{});
+    a.movImm(4, @truncate(out.va), .{});
+    a.movImm(5, @intCast(out.va >> 32), .{});
+    a.imadWide(0, Src.reg(2), Src.imm(4), Src.reg(4), false, .{});
+    a.iadd3(6, Src.reg(2), Src.imm(0x100), sass.zero, .{});
+    a.stg(0, 6, 0, .bits32, .{});
+    a.exit(.{});
+    try a.schedule();
+
+    var grids: [batch]Grid = undefined;
+    for (&grids, 0..) |*g, i| g.* = .{
+        .register_count = a.registerCount(),
+        .cbuf0_va = params.va + i * stride,
+        .cbuf0_size = 64,
+    };
+    @memset(out.slice(u32)[0..batch], 0);
+    try r.runBatch(code[0..a.dwords()], &grids);
+    for (0..batch) |i| {
+        try std.testing.expectEqual(@as(u32, 0x100 + @as(u32, @intCast(i))), out.read(u32, i));
+    }
+}
+
+/// Build the batching benchmark's kernel: read a slot index out of constant
+/// bank 0 and write a marker to that slot. Every dispatch runs this, and its
+/// bound constant bank decides which slot it touches.
+fn buildSlotWriter(a: *sass.Assembler, out_va: u64) void {
+    const Src = sass.Src;
+    a.ldc(2, .{ .offset = 0 }, sass.RZ, .bits32, .{});
+    a.movImm(4, @truncate(out_va), .{});
+    a.movImm(5, @intCast(out_va >> 32), .{});
+    a.imadWide(0, Src.reg(2), Src.imm(4), Src.reg(4), false, .{});
+    a.iadd3(6, Src.reg(2), Src.imm(0x100), sass.zero, .{});
+    a.stg(0, 6, 0, .bits32, .{});
+    a.exit(.{});
+}
+
+test "live: batching dispatches costs far less per dispatch than submitting each" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const out = try r.alloc(.system, 0x1000);
+    const params = try r.alloc(.system, 0x4000);
+    const batch = 16;
+    const stride = 256;
+    for (0..batch) |i| params.slice(u32)[i * stride / 4] = @intCast(i);
+
+    var code: [256]u32 = undefined;
+    var deps: [64]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    buildSlotWriter(&a, out.va);
+    try a.schedule();
+    const program = code[0..a.dwords()];
+
+    var grids: [batch]Grid = undefined;
+    for (&grids, 0..) |*g, i| g.* = .{
+        .register_count = a.registerCount(),
+        .cbuf0_va = params.va + i * stride,
+        .cbuf0_size = 64,
+    };
+
+    const iters = 100;
+    try r.runBatch(program, &grids); // warm the path
+    var t0 = monotonicNs();
+    for (0..iters) |_| try r.runBatch(program, &grids);
+    const batched_per = (monotonicNs() - t0) / iters / batch;
+
+    t0 = monotonicNs();
+    for (0..iters) |_| {
+        for (0..batch) |i| try r.runBatch(program, grids[i .. i + 1]);
+    }
+    const separate_per = (monotonicNs() - t0) / iters / batch;
+
+    // The last round left every slot written, whichever way it was submitted.
+    for (0..batch) |i| {
+        try std.testing.expectEqual(@as(u32, 0x100 + @as(u32, @intCast(i))), out.read(u32, i));
+    }
+    // Measured at about a third of the cost; fail well before that regresses to
+    // parity, so ordinary run-to-run noise cannot trip this.
+    if (batched_per * 5 >= separate_per * 3) {
+        std.debug.print(
+            "batched {d} ns per dispatch against {d} ns submitted one at a time\n",
+            .{ batched_per, separate_per },
+        );
+        return error.BatchingNoLongerPays;
+    }
 }
