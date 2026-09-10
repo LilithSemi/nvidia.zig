@@ -424,8 +424,11 @@ pub const Assembler = struct {
 
             releaseBarriers(wait, &bar_used, &wr_bar, &rd_bar);
 
-            if (d.variable and d.writes[0] != RZ) {
-                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar);
+            const has_write_barrier = d.variable and d.writes[0] != RZ;
+            var own_barrier: u8 = NO_BARRIER;
+            if (has_write_barrier) {
+                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar, NO_BARRIER);
+                own_barrier = b;
                 ctl.wr_barrier = @intCast(b);
                 for (d.writes) |w| {
                     if (w == RZ) continue;
@@ -442,8 +445,8 @@ pub const Assembler = struct {
                     reg_pipe[w] = if (d.variable) .other else d.pipe;
                 }
             }
-            if (d.late_read and self.writesAnyLater(i, d.reads)) {
-                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar);
+            if (d.late_read and self.writesAnyLater(i, d.reads, has_write_barrier)) {
+                const b = try takeBarrier(&bar_used, &wait, &wr_bar, &rd_bar, own_barrier);
                 ctl.rd_barrier = @intCast(b);
                 for (d.reads) |r| {
                     if (r == RZ) continue;
@@ -510,16 +513,19 @@ pub const Assembler = struct {
 
     /// Take a free scoreboard, waiting on the lowest-numbered one in use when
     /// they are all taken.
-    fn takeBarrier(used: *[BARRIERS]bool, wait: *u6, wr: *[256]u8, rd: *[256]u8) error{OutOfBarriers}!u8 {
+    fn takeBarrier(used: *[BARRIERS]bool, wait: *u6, wr: *[256]u8, rd: *[256]u8, avoid: u8) error{OutOfBarriers}!u8 {
         for (0..BARRIERS) |b| {
             if (!used[b]) {
                 used[b] = true;
                 return @intCast(b);
             }
         }
+        // All in use, so wait one out. Never the one this same instruction just
+        // took: an instruction cannot set a scoreboard twice and still have the
+        // model track what it guards.
         for (0..BARRIERS) |b| {
             const bit = @as(u6, 1) << @intCast(b);
-            if (wait.* & bit != 0) continue;
+            if (b == avoid or wait.* & bit != 0) continue;
             wait.* |= bit;
             releaseBarriers(bit, used, wr, rd);
             used[b] = true;
@@ -529,9 +535,14 @@ pub const Assembler = struct {
     }
 
     /// Whether a later instruction can overwrite one of `regs` while this one is
-    /// still reading them. Control flow makes the answer unknowable, so a branch
-    /// or a branch target ends the scan with a yes.
-    fn writesAnyLater(self: *const Assembler, i: usize, regs: [6]u8) bool {
+    /// still reading them.
+    ///
+    /// A branch or a branch target ends the scan, because what runs after it is
+    /// unknowable. What the scan answers there depends on `has_write_barrier`:
+    /// an instruction that already set one is covered, since the drain at that
+    /// boundary waits for it and so for its reads as well. One that did not, a
+    /// store for instance, has to assume the worst.
+    fn writesAnyLater(self: *const Assembler, i: usize, regs: [6]u8, has_write_barrier: bool) bool {
         // Nothing to guard when the instruction reads no register at all.
         if (regs[0] == RZ) return false;
         var j = i + 1;
@@ -541,7 +552,7 @@ pub const Assembler = struct {
                 if (g == RZ) continue;
                 for (d.writes) |w| if (w == g) return true;
             }
-            if (d.branch or d.target) return true;
+            if (d.branch or d.target) return !has_write_barrier;
         }
         return false;
     }
