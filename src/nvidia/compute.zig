@@ -322,6 +322,34 @@ pub const Buffer = struct {
     }
 };
 
+/// The transfer size at which the copy engine overtakes the inline path on this
+/// hardware. Below it, put the payload in the pushbuffer with
+/// `Stream.uploadInline`; above it, hand the copy engine a source buffer with
+/// `Runner.copyLinear`.
+///
+/// Measured on the GB10 in September 2026, nanoseconds per transfer, submission
+/// and fence included:
+///
+///     bytes | inline |    CE
+///       256 |   4265 |  4415
+///      4096 |   4435 |  4589
+///     16384 |   5206 |  5204
+///     24576 |   5692 |  5439
+///     65536 |   8875 |  7159
+///
+/// The crossover sits between 16 and 24 KiB, close to the 24 KiB that NVIDIA.s
+/// own driver uses on Ampere (arXiv:2604.26889). Note what else the table says:
+/// both paths cost about 4.3 us at the small end, so a single small transfer is
+/// almost entirely submission overhead rather than transfer. Cutting the number
+/// of submissions matters more than choosing between these two.
+pub const inline_upload_limit_bytes: u32 = 16 * 1024;
+
+/// Whether a transfer of `bytes` is cheaper through the pushbuffer than through
+/// the copy engine.
+pub fn preferInlineUpload(bytes: u32) bool {
+    return bytes < inline_upload_limit_bytes;
+}
+
 /// A ready-to-use compute context: a GPFIFO channel bound to the compute class,
 /// a VA space with a bump allocator behind `alloc`, and the code, descriptor,
 /// pushbuffer and semaphore a launch needs. `run` uploads a kernel, dispatches
@@ -1869,4 +1897,63 @@ test "live: a linear copy on the copy engine moves a buffer" {
 
     try r.copyLinear(dst.va, src.va, 1024 * 4);
     for (0..1024) |i| try std.testing.expectEqual(sv[i], dst.read(u32, i));
+}
+
+/// Monotonic nanoseconds, for the transfer-path measurement below.
+fn monotonicNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Time `iters` transfers of `words` dwords through both paths.
+fn timeBothPaths(r: *Runner, dst: Buffer, src: Buffer, payload: []const u32, words: usize) !struct { inline_ns: u64, ce_ns: u64 } {
+    const iters = 200;
+    const bytes: u32 = @intCast(words * 4);
+    try r.uploadInline(dst.va, payload[0..words]); // warm the path
+    var t0 = monotonicNs();
+    for (0..iters) |_| try r.uploadInline(dst.va, payload[0..words]);
+    const inline_ns = (monotonicNs() - t0) / iters;
+
+    try r.copyLinear(dst.va, src.va, bytes);
+    t0 = monotonicNs();
+    for (0..iters) |_| try r.copyLinear(dst.va, src.va, bytes);
+    const ce_ns = (monotonicNs() - t0) / iters;
+    return .{ .inline_ns = inline_ns, .ce_ns = ce_ns };
+}
+
+test "live: the inline path costs more per byte than the copy engine" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const big = 64 * 1024;
+    const small = 4 * 1024;
+    const src = try r.alloc(.system, big);
+    const dst = try r.alloc(.system, big);
+    const payload = try std.testing.allocator.alloc(u32, big / 4);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*w, i| w.* = @intCast(0x600d_0000 +% i);
+    @memcpy(src.slice(u32)[0 .. big / 4], payload);
+
+    const at_small = try timeBothPaths(&r, dst, src, payload, small / 4);
+    // Both paths have to deliver the same bytes whichever one is faster.
+    for (0..small / 4) |i| try std.testing.expectEqual(payload[i], dst.read(u32, i));
+    const at_big = try timeBothPaths(&r, dst, src, payload, big / 4);
+    for (0..big / 4) |i| try std.testing.expectEqual(payload[i], dst.read(u32, i));
+
+    // The payload rides in the pushbuffer, so the inline path pays for every
+    // byte twice: once for the host to fetch the pushbuffer and once to write
+    // the destination. Its cost therefore climbs faster with size, which is why
+    // a crossover exists at all and why `inline_upload_limit_bytes` is finite.
+    const inline_growth = at_big.inline_ns - at_small.inline_ns;
+    const ce_growth = at_big.ce_ns - at_small.ce_ns;
+    if (inline_growth <= ce_growth) {
+        std.debug.print(
+            "inline grew {d} ns over {d} bytes, the copy engine {d} ns\n",
+            .{ inline_growth, big - small, ce_growth },
+        );
+        return error.CrossoverGone;
+    }
+    // And the constant has to sit where the measurement puts it.
+    try std.testing.expect(preferInlineUpload(small));
+    try std.testing.expect(!preferInlineUpload(big));
 }
