@@ -2206,3 +2206,53 @@ test "the address allocator steps over the driver's reserved span" {
     try std.testing.expectEqual(rm.Client.RESERVED_VA_END, next);
     try std.testing.expect(!rm.Client.vaIsReserved(next, 0x1000));
 }
+
+test "live: a load keeps its address until it has read it, at high occupancy" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const blocks = 16384;
+    const threads = 32;
+    const count = blocks * threads;
+    const in = try r.alloc(.system, count * 4);
+    const out = try r.alloc(.system, count * 4);
+    for (in.slice(u32)[0..count], 0..) |*w, i| w.* = @intCast(i);
+    const Src = sass.Src;
+
+    var code: [256]u32 = undefined;
+    var deps: [64]sass.Dep = @splat(.{});
+    var a = sass.Assembler{ .code = &code, .deps = &deps };
+    a.s2r(2, sass.SR_TID_X, .{});
+    a.s2r(3, sass.SR_CTAID_X, .{});
+    a.imad(4, Src.reg(3), Src.imm(threads), Src.reg(2), false, .{});
+    a.movImm(6, @truncate(in.va), .{});
+    a.movImm(7, @intCast(in.va >> 32), .{});
+    a.imadWide(0, Src.reg(4), Src.imm(4), Src.reg(6), false, .{});
+    const load_at = a.here();
+    a.ldg(8, 0, 0, .bits32, .{});
+    // Step the address straight afterwards. Without a read scoreboard the load
+    // can pick up the stepped address and return the next element instead.
+    a.iadd3(0, Src.reg(0), Src.imm(4), sass.zero, .{});
+    a.movImm(10, @truncate(out.va), .{});
+    a.movImm(11, @intCast(out.va >> 32), .{});
+    a.imadWide(12, Src.reg(4), Src.imm(4), Src.reg(10), false, .{});
+    a.stg(12, 8, 0, .bits32, .{});
+    a.exit(.{});
+    try a.schedule();
+
+    // The scheduler has to have guarded it, whatever the hardware tolerates.
+    const rd = (code[load_at * 4 + 3] >> 17) & 0x7;
+    try std.testing.expect(rd != 7);
+
+    @memset(out.slice(u32)[0..count], 0xffff_ffff);
+    try r.run(code[0..a.dwords()], .{
+        .register_count = a.registerCount(),
+        .grid = .{ blocks, 1, 1 },
+        .block = .{ threads, 1, 1 },
+    });
+    for (0..count) |i| {
+        if (out.read(u32, i) != @as(u32, @intCast(i))) {
+            std.debug.print("thread {d} read {d}\n", .{ i, out.read(u32, i) });
+            return error.LoadUsedTheSteppedAddress;
+        }
+    }
+}
