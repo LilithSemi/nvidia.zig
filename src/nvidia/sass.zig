@@ -225,6 +225,11 @@ pub const Dep = struct {
     pred_read: u8 = PT,
     /// The result arrives at an unpredictable time, so a consumer has to wait on
     /// a scoreboard instead of counting cycles.
+    ///
+    /// Memory and S2R are the obvious ones. NAK also classes the conversions and
+    /// bit-counting ops as decoupled: F2F, F2I, I2F, FRND, POPC, FLO and BREV.
+    /// This encoder emits none of those yet; whoever adds one has to set this,
+    /// because a fixed stall for them is a guess rather than a guarantee.
     variable: bool = false,
     /// The instruction reads its sources after it issues (a memory op holding an
     /// address), so an instruction that overwrites those sources must wait too.
