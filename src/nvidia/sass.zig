@@ -207,8 +207,23 @@ pub const Latency = struct {
     /// which no single-instruction analysis has localised.
     ///
     /// So this is not padding against a known effect, it is honesty about an
-    /// unknown one. Instructions that depend on nothing are unaffected: they
-    /// still issue back to back.
+    /// unknown one. What is known about that unknown, from unrolling the tiled
+    /// matmul inner loop and failing to ship it twice:
+    ///
+    /// The trigger is the outer tile loop running more than once. One block with
+    /// one tile is correct; one block with two tiles is wrong. Four blocks with
+    /// one tile are correct, so it is not about blocks. Sizes that are exact
+    /// multiples of the tile fail too, so it is not the boundary guards, and the
+    /// guards are predicated rather than branched anyway. The wrong answers are
+    /// whole rows of the staged tile and they move between runs, so it is a race
+    /// rather than a short dependency. Ruled out by measurement: register
+    /// banking, the latency table being an average, scoreboard pressure (one
+    /// pair in flight fails the same as four), shared memory visibility at
+    /// either barrier (a CTA membar on both sides changes nothing), and code
+    /// layout, since a stall bump moves no instruction bytes at all.
+    ///
+    /// Instructions that depend on nothing are unaffected: they still issue back
+    /// to back.
     pub const margin: u8 = 1;
 };
 
