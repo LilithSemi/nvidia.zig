@@ -230,8 +230,20 @@ pub const Latency = struct {
     /// CTA membar on both sides changes nothing), outstanding shared loads at
     /// the barrier (every load is already waited on by name where its value is
     /// used, and forcing the fence to drain all six scoreboards changes
-    /// nothing), the barrier's predicate source at bits 87..90, and code layout,
-    /// since a stall bump moves no instruction bytes at all.
+    /// nothing), the barrier's predicate source at bits 87..90, which ptxas also
+    /// leaves zero so the field is unused for this form, the barrier's
+    /// DEFER_BLOCKING bit at 80, which ptxas sets on every __syncthreads() and
+    /// neither NAK nor this encoder does, and code layout, since a stall bump
+    /// moves no instruction bytes at all.
+    ///
+    /// One architectural fact worth keeping, from a ptxas dump of a tiled
+    /// matmul: it issues shared loads that cross a BAR.SYNC and consumes them
+    /// after it, with an empty wait mask on every barrier in the kernel. So the
+    /// hardware finishes the shared access before the barrier releases and only
+    /// the register writeback is late. Draining scoreboards at a barrier is
+    /// therefore wrong on the merits rather than merely useless, and this kernel
+    /// is already stricter than NVIDIA's, since every load here is consumed
+    /// before the barrier rather than across it.
     ///
     /// The one structural difference left: the looped inner loop leaves P0
     /// uniformly false at the second barrier, because that is the condition that
