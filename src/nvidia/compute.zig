@@ -22,6 +22,13 @@ const SEND_PCAS_A = 0x02b4;
 const SEND_SIGNALING_PCAS2_B = 0x02c0;
 const SET_SHADER_LOCAL_MEMORY_WINDOW_A = 0x07b0; // + _B at 0x07b4
 const INVALIDATE_SHADER_CACHES = 0x021c;
+// Inline-to-memory (I2M): the payload rides in the pushbuffer instead of coming
+// from a source buffer. 0x0180..0x0190 are five contiguous method offsets.
+const LINE_LENGTH_IN = 0x0180; // + LINE_COUNT, OFFSET_OUT_UPPER, OFFSET_OUT, PITCH_OUT
+const I2M_LAUNCH_DMA = 0x01b0;
+const LOAD_INLINE_DATA = 0x01b4;
+// DST_MEMORY_LAYOUT = PITCH, COMPLETION_TYPE = FLUSH_ONLY, everything else off.
+const I2M_LAUNCH_PITCH_FLUSH: sdk.NvV32 = 0x11;
 // INSTRUCTION | LOCKS | FLUSH_DATA | DATA | CONSTANT
 const INVALIDATE_ALL_SHADER_CACHES: sdk.NvV32 = 0x1017;
 const PCAS_INVALIDATE_COPY_SCHEDULE = 3;
@@ -146,6 +153,39 @@ pub const Stream = struct {
     /// instruction cache.
     pub fn invalidateShaderCaches(self: *Stream) void {
         self.m1(INVALIDATE_SHADER_CACHES, INVALIDATE_ALL_SHADER_CACHES);
+    }
+
+    /// Write `data` into memory at `dst_va` from the pushbuffer itself, with no
+    /// source buffer and no copy engine. The host unit feeds the payload to the
+    /// compute engine as it reads the pushbuffer, which skips the copy engine's
+    /// launch cost entirely; NVIDIA's own driver picks this path for small
+    /// transfers. The cost is pushbuffer space, so it only pays below the
+    /// crossover measured in the test at the bottom of this file.
+    ///
+    /// `dst_va` must be 4-byte aligned. The caller's buffer has to hold
+    /// `data.len + 8` dwords or so of headers on top of the payload.
+    pub fn uploadInline(self: *Stream, dst_va: u64, data: []const u32) void {
+        std.debug.assert(dst_va % 4 == 0);
+        if (data.len == 0) return;
+        self.mm(LINE_LENGTH_IN, &.{
+            @intCast(data.len * 4), // LINE_LENGTH_IN, in bytes
+            1, // LINE_COUNT: one line
+            @intCast(dst_va >> 32), // OFFSET_OUT_UPPER
+            @truncate(dst_va), // OFFSET_OUT
+            @intCast(data.len * 4), // PITCH_OUT
+        });
+        self.m1(I2M_LAUNCH_DMA, I2M_LAUNCH_PITCH_FLUSH);
+        // One method header carries at most 8191 dwords, so a long payload needs
+        // several. The engine keeps writing where the last chunk left off.
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const chunk = @min(data.len - sent, sdk.gpfifo.MAX_METHOD_COUNT);
+            self.buf[self.n] = sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, @intCast(chunk));
+            self.n += 1;
+            @memcpy(self.buf[self.n..][0..chunk], data[sent..][0..chunk]);
+            self.n += chunk;
+            sent += chunk;
+        }
     }
 
     /// Launch the QMD at `qmd_va` (256-byte aligned): point the work distributor
@@ -303,7 +343,8 @@ pub const Runner = struct {
     const VA_BASE: u64 = 0x1000_0000;
     const VA_STEP: u64 = 0x20_0000;
     const CODE_BYTES = 0x1000; // matches the QMD's 4 KB program prefetch
-    const PUSH_BYTES = 0x1000;
+    // Big enough for a sizeable inline upload: the payload rides in here.
+    const PUSH_BYTES = 0x20000;
     const GPFIFO_BYTES = 0x2000;
     const GPFIFO_ENTRIES = 0x100;
     /// How long to poll the completion semaphore before calling the grid hung.
@@ -400,6 +441,30 @@ pub const Runner = struct {
         return .{ .va = va, .bytes = cpu.bytes[0..rounded], .memory = mem };
     }
 
+    /// Send `data` into `dst_va` through the pushbuffer and wait for it to land.
+    /// This is the small-transfer path: no source buffer and no copy engine, at
+    /// the cost of carrying the payload in the pushbuffer.
+    pub fn uploadInline(self: *Runner, dst_va: u64, data: []const u32) !void {
+        var s = Stream{ .buf = self.push.slice(u32) };
+        s.setup();
+        s.uploadInline(dst_va, data);
+        self.seq += 1;
+        s.fence(self.sem.va, self.seq);
+        return self.submitAndWait(s.dwords());
+    }
+
+    /// Ring the doorbell for the pushbuffer and spin until the fence lands.
+    fn submitAndWait(self: *Runner, dwords: u32) !void {
+        const semp: *volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
+        semp.* = 0;
+        self.queue.submit(self.push.va, dwords);
+        var spins: u64 = 0;
+        while (spins < SPIN_LIMIT) : (spins += 1) {
+            if (semp.* == self.seq) return;
+        }
+        return error.GridTimeout;
+    }
+
     /// Upload `code`, dispatch grid `g`, and wait for it. `g.prog_va` is filled
     /// in here. A grid that never signals gives `error.GridTimeout`, which means
     /// the kernel hung or faulted.
@@ -419,15 +484,7 @@ pub const Runner = struct {
         s.dispatch(self.descriptor.va);
         self.seq += 1;
         s.fence(self.sem.va, self.seq);
-
-        const semp: *volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
-        semp.* = 0;
-        self.queue.submit(self.push.va, s.dwords());
-        var spins: u64 = 0;
-        while (spins < SPIN_LIMIT) : (spins += 1) {
-            if (semp.* == self.seq) return;
-        }
-        return error.GridTimeout;
+        return self.submitAndWait(s.dwords());
     }
 };
 
@@ -1665,4 +1722,66 @@ test "live: a loop that stages through shared memory keeps its blocks in step" {
         });
         for (0..threads) |i| try std.testing.expectEqual(@as(u32, 0), out.read(u32, i));
     }
+}
+
+test "inline upload encodes a non-incrementing payload after the launch" {
+    var buf: [64]u32 = undefined;
+    var s = Stream{ .buf = &buf };
+    const payload = [_]u32{ 0xaa, 0xbb, 0xcc };
+    s.uploadInline(0x1234_5000, &payload);
+
+    // Five contiguous geometry methods, then the launch, then the payload.
+    try std.testing.expectEqual(sdk.gpfifo.methodHeader(LINE_LENGTH_IN, SUBCH, 5), buf[0]);
+    try std.testing.expectEqual(@as(u32, 12), buf[1]); // bytes
+    try std.testing.expectEqual(@as(u32, 1), buf[2]); // one line
+    try std.testing.expectEqual(@as(u32, 0), buf[3]); // destination high
+    try std.testing.expectEqual(@as(u32, 0x1234_5000), buf[4]); // destination low
+    try std.testing.expectEqual(sdk.gpfifo.methodHeader(I2M_LAUNCH_DMA, SUBCH, 1), buf[6]);
+    try std.testing.expectEqual(I2M_LAUNCH_PITCH_FLUSH, buf[7]);
+    // The payload goes to one method address, so the header is non-incrementing.
+    try std.testing.expectEqual(sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, 3), buf[8]);
+    try std.testing.expectEqual(@as(u32, 0xaa), buf[9]);
+    try std.testing.expectEqual(@as(u32, 0xcc), buf[11]);
+    try std.testing.expectEqual(@as(u32, 12), s.dwords());
+}
+
+test "inline upload splits a payload too long for one method header" {
+    const long = sdk.gpfifo.MAX_METHOD_COUNT + 5;
+    const payload = try std.testing.allocator.alloc(u32, long);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*w, i| w.* = @intCast(i);
+    const buf = try std.testing.allocator.alloc(u32, long + 16);
+    defer std.testing.allocator.free(buf);
+
+    var s = Stream{ .buf = buf };
+    s.uploadInline(0x2000, payload);
+    // The first chunk fills a header, the second carries the remainder.
+    try std.testing.expectEqual(
+        sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, sdk.gpfifo.MAX_METHOD_COUNT),
+        buf[8],
+    );
+    const second = 9 + sdk.gpfifo.MAX_METHOD_COUNT;
+    try std.testing.expectEqual(sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, 5), buf[second]);
+    try std.testing.expectEqual(@as(u32, sdk.gpfifo.MAX_METHOD_COUNT), buf[second + 1]);
+    try std.testing.expectEqual(@as(u32, long - 1), buf[second + 5]);
+}
+
+test "live: an inline upload lands in memory without a source buffer" {
+    var r = try Runner.init();
+    defer r.deinit();
+    const dst = try r.alloc(.system, 0x10000);
+
+    // A short payload, the size NVIDIA's driver would send this way.
+    var small: [256]u32 = undefined;
+    for (&small, 0..) |*w, i| w.* = @intCast(0xc0de_0000 + i);
+    try r.uploadInline(dst.va, &small);
+    for (small, 0..) |want, i| try std.testing.expectEqual(want, dst.read(u32, i));
+
+    // A payload longer than one method header can carry, to cover the chunking.
+    const long = try std.testing.allocator.alloc(u32, sdk.gpfifo.MAX_METHOD_COUNT + 37);
+    defer std.testing.allocator.free(long);
+    for (long, 0..) |*w, i| w.* = @intCast(0x5a5a_0000 +% i);
+    @memset(dst.slice(u32)[0..long.len], 0);
+    try r.uploadInline(dst.va, long);
+    for (long, 0..) |want, i| try std.testing.expectEqual(want, dst.read(u32, i));
 }

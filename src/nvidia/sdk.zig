@@ -369,6 +369,14 @@ pub const gpfifo = struct {
     pub fn methodHeader(addr: u32, subch: u32, count: u32) NvU32 {
         return (1 << 29) | (count << 16) | (subch << 13) | (addr >> 2);
     }
+    /// A "non-increasing method" header (SEC_OP=NON_INC): all `count` data dwords
+    /// go to the same method `addr`. This is how a payload rides in the
+    /// pushbuffer itself, as `LOAD_INLINE_DATA` does.
+    pub fn methodHeaderNonInc(addr: u32, subch: u32, count: u32) NvU32 {
+        return (3 << 29) | (count << 16) | (subch << 13) | (addr >> 2);
+    }
+    /// The largest `count` a single method header can carry (the field is 13 bits).
+    pub const MAX_METHOD_COUNT: u32 = (1 << 13) - 1;
     // USERD byte offsets (NV_RAMUSERD, Volta+): GP_GET = word 34, GP_PUT = word 35.
     pub const USERD_GP_GET_OFFSET = 0x88;
     pub const USERD_GP_PUT_OFFSET = 0x8c;
