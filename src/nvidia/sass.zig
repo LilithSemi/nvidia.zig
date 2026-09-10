@@ -242,8 +242,13 @@ pub const Latency = struct {
     /// hardware finishes the shared access before the barrier releases and only
     /// the register writeback is late. Draining scoreboards at a barrier is
     /// therefore wrong on the merits rather than merely useless, and this kernel
-    /// is already stricter than NVIDIA's, since every load here is consumed
-    /// before the barrier rather than across it.
+    /// is already stricter than NVIDIA's on that axis, since every load here is
+    /// consumed before the barrier rather than across it.
+    ///
+    /// It is looser on one axis, which turned out not to matter: ptxas stalls 6
+    /// cycles on every barrier it ships and this scheduler works out 1, because
+    /// a barrier has no register dependency to wait for. Forcing the fence stall
+    /// to 6 and to 15 changes nothing here, so that difference is real and inert.
     ///
     /// The one structural difference left: the looped inner loop leaves P0
     /// uniformly false at the second barrier, because that is the condition that
