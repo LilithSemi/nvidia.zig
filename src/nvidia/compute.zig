@@ -1937,26 +1937,20 @@ test "live: a linear copy on the copy engine moves a buffer" {
     for (0..1024) |i| try std.testing.expectEqual(sv[i], dst.read(u32, i));
 }
 
-/// Monotonic nanoseconds, for the transfer-path measurement below.
-fn monotonicNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-/// Time `iters` transfers of `words` dwords through both paths.
+/// Time `iters` transfers of `words` dwords through both paths. `awake` is the
+/// clock that counts forward without jumping; on Linux it is CLOCK_MONOTONIC.
 fn timeBothPaths(r: *Runner, dst: Buffer, src: Buffer, payload: []const u32, words: usize) !struct { inline_ns: u64, ce_ns: u64 } {
     const iters = 200;
     const bytes: u32 = @intCast(words * 4);
     try r.uploadInline(dst.va, payload[0..words]); // warm the path
-    var t0 = monotonicNs();
+    var start: std.Io.Timestamp = .now(std.testing.io, .awake);
     for (0..iters) |_| try r.uploadInline(dst.va, payload[0..words]);
-    const inline_ns = (monotonicNs() - t0) / iters;
+    const inline_ns: u64 = @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters));
 
     try r.copyLinear(dst.va, src.va, bytes);
-    t0 = monotonicNs();
+    start = .now(std.testing.io, .awake);
     for (0..iters) |_| try r.copyLinear(dst.va, src.va, bytes);
-    const ce_ns = (monotonicNs() - t0) / iters;
+    const ce_ns: u64 = @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters));
     return .{ .inline_ns = inline_ns, .ce_ns = ce_ns };
 }
 
@@ -2073,15 +2067,15 @@ test "live: batching dispatches costs far less per dispatch than submitting each
 
     const iters = 100;
     try r.runBatch(program, &grids); // warm the path
-    var t0 = monotonicNs();
+    var start: std.Io.Timestamp = .now(std.testing.io, .awake);
     for (0..iters) |_| try r.runBatch(program, &grids);
-    const batched_per = (monotonicNs() - t0) / iters / batch;
+    const batched_per: u64 = @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters * batch));
 
-    t0 = monotonicNs();
+    start = .now(std.testing.io, .awake);
     for (0..iters) |_| {
         for (0..batch) |i| try r.runBatch(program, grids[i .. i + 1]);
     }
-    const separate_per = (monotonicNs() - t0) / iters / batch;
+    const separate_per: u64 = @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters * batch));
 
     // The last round left every slot written, whichever way it was submitted.
     for (0..batch) |i| {
@@ -2148,9 +2142,9 @@ test "live: the FP32 multiply-add pipes reach their expected rate" {
             .block = .{ threads, 1, 1 },
         };
         try r.run(code[0..a.dwords()], g); // warm
-        const t0 = monotonicNs();
+        const start: std.Io.Timestamp = .now(std.testing.io, .awake);
         try r.run(code[0..a.dwords()], g);
-        const ns = monotonicNs() - t0;
+        const ns: u64 = @intCast(start.durationTo(.now(std.testing.io, .awake)).nanoseconds);
         try std.testing.expectEqual(want, out.read(f32, 0));
         try std.testing.expectEqual(want, out.read(f32, blocks * threads - 1));
         const flops = @as(f64, @floatFromInt(blocks)) * threads * accs * rounds * trips * 2;
