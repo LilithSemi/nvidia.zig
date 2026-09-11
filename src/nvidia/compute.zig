@@ -304,6 +304,8 @@ fn smemConfig(bytes: u32) u32 {
 }
 
 /// One allocation: the CPU bytes and the GPU virtual address they appear at.
+/// The Runner owns its memory and mappings. Call `Runner.freeBuffer` to release
+/// it early. Otherwise, `Runner.deinit` releases it.
 pub const Buffer = struct {
     va: u64,
     bytes: []u8,
@@ -352,13 +354,14 @@ pub fn preferInlineUpload(bytes: u32) bool {
 
 /// A ready-to-use compute context: a GPFIFO channel bound to the compute class,
 /// a VA space with a bump allocator behind `alloc`, and the code, descriptor,
-/// pushbuffer and semaphore a launch needs. `run` uploads a kernel, dispatches
-/// it, and waits for it, so a kernel test is a few lines instead of sixty.
+/// pushbuffer and semaphore a launch needs. Runner owns every CPU and GPU
+/// mapping that it creates. `run` uploads a kernel, dispatches it, and waits for
+/// it, so a kernel test is a few lines instead of sixty.
 pub const Runner = struct {
     client: rm.Client,
     dev: rm.Device,
     vaspace: sdk.NvHandle,
-    channel: rm.Channel,
+    channel: ?rm.Channel = null,
     queue: rm.Queue,
     next_va: u64 = VA_BASE,
     seq: u32 = 0,
@@ -376,6 +379,14 @@ pub const Runner = struct {
     copy_sem: Buffer = undefined,
     copy_seq: u32 = 0,
     doorbell: []u8 = &.{},
+    allocations: [MAX_ALLOCATIONS]Allocation = undefined,
+    allocation_count: usize = 0,
+
+    const Allocation = struct {
+        memory: rm.Memory,
+        cpu_mapping: ?rm.Mapping = null,
+        gpu_mapping: ?rm.GpuMapping = null,
+    };
 
     /// Where the bump allocator starts, and the step between allocations. One
     /// 2 MB step per buffer keeps every allocation on its own big page.
@@ -389,6 +400,7 @@ pub const Runner = struct {
     const PUSH_BYTES = 0x20000;
     const GPFIFO_BYTES = 0x2000;
     const GPFIFO_ENTRIES = 0x100;
+    const MAX_ALLOCATIONS = 64;
     /// How long to poll the completion semaphore before calling the grid hung.
     const SPIN_LIMIT = 200_000_000;
 
@@ -406,22 +418,22 @@ pub const Runner = struct {
             .client = client,
             .dev = dev,
             .vaspace = vaspace,
-            .channel = undefined,
             .queue = undefined,
             .code = undefined,
             .descriptor = undefined,
             .push = undefined,
             .sem = undefined,
         };
+        errdefer self.releaseOwnedResources();
 
         // The ring and the USERD are read by the host unit, so they live in VRAM.
         // Only the ring needs a GPU virtual address.
-        const gpfifo = try self.client.allocMemory(dev, .vram, GPFIFO_BYTES);
+        const gpfifo = try self.allocMemory(.vram, GPFIFO_BYTES);
         const gpfifo_va = self.takeVa(GPFIFO_BYTES);
-        _ = try self.client.mapToGpu(dev, vaspace, gpfifo, gpfifo_va);
-        const gpfifo_cpu = try self.client.mapMemory(dev, gpfifo);
-        const userd = try self.client.allocMemory(dev, .vram, 0x1000);
-        const userd_cpu = try self.client.mapMemory(dev, userd);
+        _ = try self.mapToGpu(gpfifo, gpfifo_va);
+        const gpfifo_cpu = try self.mapToCpu(gpfifo);
+        const userd = try self.allocMemory(.vram, 0x1000);
+        const userd_cpu = try self.mapToCpu(userd);
 
         // Code and descriptor are write-combined: the CPU only writes them.
         self.code = try self.alloc(.system_wc, CODE_BYTES);
@@ -442,12 +454,8 @@ pub const Runner = struct {
         try self.client.bindChannel(dev, ch, sdk.NV2080_ENGINE_TYPE_GRAPHICS);
         try self.client.scheduleChannel(dev, ch, true);
         const token = try self.client.workSubmitToken(dev, ch);
-        const usermode = try self.client.allocUsermode(dev, sdk.BLACKWELL_USERMODE_A);
-        const door = try self.client.mapMemory(dev, .{
-            .handle = usermode,
-            .size = 0x1000,
-            .location = .vram,
-        });
+        const usermode_memory = try self.allocUsermodeMemory();
+        const door = try self.mapToCpu(usermode_memory);
 
         self.channel = ch;
         self.doorbell = door.bytes;
@@ -466,12 +474,15 @@ pub const Runner = struct {
     /// page with the compute channel.
     fn ensureCopyChannel(self: *Runner) !void {
         if (self.copy_channel != null) return;
-        const gpfifo = try self.client.allocMemory(self.dev, .vram, GPFIFO_BYTES);
+        const first_allocation = self.allocation_count;
+        errdefer self.releaseAllocationsFrom(first_allocation);
+
+        const gpfifo = try self.allocMemory(.vram, GPFIFO_BYTES);
         const gpfifo_va = self.takeVa(GPFIFO_BYTES);
-        _ = try self.client.mapToGpu(self.dev, self.vaspace, gpfifo, gpfifo_va);
-        const gpfifo_cpu = try self.client.mapMemory(self.dev, gpfifo);
-        const userd = try self.client.allocMemory(self.dev, .vram, 0x1000);
-        const userd_cpu = try self.client.mapMemory(self.dev, userd);
+        _ = try self.mapToGpu(gpfifo, gpfifo_va);
+        const gpfifo_cpu = try self.mapToCpu(gpfifo);
+        const userd = try self.allocMemory(.vram, 0x1000);
+        const userd_cpu = try self.mapToCpu(userd);
         self.copy_push = try self.alloc(.system, 0x1000);
         self.copy_sem = try self.alloc(.system, 0x1000);
 
@@ -484,6 +495,7 @@ pub const Runner = struct {
             userd,
             sdk.NV2080_ENGINE_TYPE_COPY0,
         );
+        errdefer self.client.rmFree(self.dev.client, self.dev.device, ch.handle);
         _ = try self.client.allocObject(self.dev, ch, sdk.BLACKWELL_DMA_COPY_B);
         try self.client.bindChannel(self.dev, ch, sdk.NV2080_ENGINE_TYPE_COPY0);
         try self.client.scheduleChannel(self.dev, ch, true);
@@ -523,9 +535,92 @@ pub const Runner = struct {
     }
 
     pub fn deinit(self: *Runner) void {
-        self.client.rmFree(self.dev.client, self.dev.device, self.channel.handle);
+        self.releaseOwnedResources();
         self.client.freeDevice(self.dev);
         self.client.deinit();
+    }
+
+    fn releaseOwnedResources(self: *Runner) void {
+        if (self.copy_channel) |channel| {
+            self.client.rmFree(self.dev.client, self.dev.device, channel.handle);
+            self.copy_channel = null;
+        }
+        if (self.channel) |channel| {
+            self.client.rmFree(self.dev.client, self.dev.device, channel.handle);
+            self.channel = null;
+        }
+        self.releaseAllocationsFrom(0);
+        self.client.rmFree(self.dev.client, self.dev.device, self.vaspace);
+    }
+
+    fn releaseAllocationsFrom(self: *Runner, first: usize) void {
+        while (self.allocation_count > first) {
+            self.releaseAllocation(self.allocation_count - 1);
+        }
+    }
+
+    fn releaseAllocation(self: *Runner, index: usize) void {
+        const allocation = self.allocations[index];
+        if (allocation.cpu_mapping) |mapping| self.client.unmapMemory(mapping);
+        if (allocation.gpu_mapping) |mapping| {
+            self.client.unmapFromGpu(self.dev, mapping);
+        }
+        self.client.freeMemory(self.dev, allocation.memory);
+
+        self.allocation_count -= 1;
+        if (index != self.allocation_count) {
+            self.allocations[index] = self.allocations[self.allocation_count];
+        }
+    }
+
+    fn findAllocation(self: *Runner, memory: rm.Memory) ?usize {
+        for (self.allocations[0..self.allocation_count], 0..) |allocation, index| {
+            if (allocation.memory.handle == memory.handle) return index;
+        }
+        return null;
+    }
+
+    fn trackMemory(self: *Runner, memory: rm.Memory) !void {
+        if (self.allocation_count == MAX_ALLOCATIONS) return error.RunnerAllocationLimit;
+        self.allocations[self.allocation_count] = .{ .memory = memory };
+        self.allocation_count += 1;
+    }
+
+    fn allocMemory(self: *Runner, location: rm.Memory.Location, size: u64) !rm.Memory {
+        if (self.allocation_count == MAX_ALLOCATIONS) return error.RunnerAllocationLimit;
+        const memory = try self.client.allocMemory(self.dev, location, size);
+        errdefer self.client.freeMemory(self.dev, memory);
+        try self.trackMemory(memory);
+        return memory;
+    }
+
+    fn allocUsermodeMemory(self: *Runner) !rm.Memory {
+        if (self.allocation_count == MAX_ALLOCATIONS) return error.RunnerAllocationLimit;
+        const handle = try self.client.allocUsermode(self.dev, sdk.BLACKWELL_USERMODE_A);
+        errdefer self.client.rmFree(self.dev.client, self.dev.device, handle);
+        const memory: rm.Memory = .{
+            .handle = handle,
+            .size = 0x1000,
+            .location = .vram,
+        };
+        try self.trackMemory(memory);
+        return memory;
+    }
+
+    fn mapToCpu(self: *Runner, memory: rm.Memory) !rm.Mapping {
+        const index = self.findAllocation(memory) orelse unreachable;
+        std.debug.assert(self.allocations[index].cpu_mapping == null);
+        const mapping = try self.client.mapMemory(self.dev, memory);
+        self.allocations[index].cpu_mapping = mapping;
+        return mapping;
+    }
+
+    fn mapToGpu(self: *Runner, memory: rm.Memory, va: u64) !rm.GpuMapping {
+        const index = self.findAllocation(memory) orelse unreachable;
+        std.debug.assert(self.allocations[index].gpu_mapping == null);
+        const mapping = try self.client.mapToGpu(self.dev, self.vaspace, memory, va);
+        self.allocations[index].gpu_mapping = mapping;
+        return mapping;
     }
 
     fn takeVa(self: *Runner, size: u64) u64 {
@@ -541,12 +636,20 @@ pub const Runner = struct {
     /// Allocate `size` bytes, map them to the GPU and to the CPU, and zero them.
     pub fn alloc(self: *Runner, location: rm.Memory.Location, size: u64) !Buffer {
         const rounded = std.mem.alignForward(u64, @max(size, 0x1000), 0x1000);
-        const mem = try self.client.allocMemory(self.dev, location, rounded);
+        const mem = try self.allocMemory(location, rounded);
+        errdefer self.releaseAllocation(self.findAllocation(mem) orelse unreachable);
         const va = self.takeVa(rounded);
-        _ = try self.client.mapToGpu(self.dev, self.vaspace, mem, va);
-        const cpu = try self.client.mapMemory(self.dev, mem);
+        _ = try self.mapToGpu(mem, va);
+        const cpu = try self.mapToCpu(mem);
         @memset(cpu.bytes[0..rounded], 0);
         return .{ .va = va, .bytes = cpu.bytes[0..rounded], .memory = mem };
+    }
+
+    /// Release a buffer returned by `alloc`. All copies of `buffer` become
+    /// invalid when this function returns.
+    pub fn freeBuffer(self: *Runner, buffer: Buffer) void {
+        const index = self.findAllocation(buffer.memory) orelse unreachable;
+        self.releaseAllocation(index);
     }
 
     /// Send `data` into `dst_va` through the pushbuffer and wait for it to land.
@@ -621,6 +724,18 @@ pub const Runner = struct {
         return self.submitAndWait(s.dwords());
     }
 };
+
+test "live: freeBuffer releases its tracked CPU and GPU mappings" {
+    var runner = try Runner.init();
+    defer runner.deinit();
+    const allocation_count = runner.allocation_count;
+
+    const buffer = try runner.alloc(.system, 0x1000);
+    try std.testing.expectEqual(allocation_count + 1, runner.allocation_count);
+    runner.freeBuffer(buffer);
+    try std.testing.expectEqual(allocation_count, runner.allocation_count);
+    try std.testing.expect(runner.findAllocation(buffer.memory) == null);
+}
 
 test "live: integer ALU (IADD3, IMAD, IMAD.WIDE, ISETP, SEL) computes on the SMs" {
     var r = try Runner.init();
