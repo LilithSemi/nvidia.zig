@@ -679,15 +679,13 @@ test "live: memToDmaBuf: system memory -> real dma-buf fd" {
     try std.testing.expect(@as(isize, @bitCast(link_len)) > 0);
     const target_str = link_target[0..link_len];
 
-    // Log the target so the test output shows the readlink value.
-    std.debug.print("\n[dmabuf test] readlink({s}) = {s}\n", .{ proc_path, target_str });
-
     // The presence of "dmabuf" in the link target is the acceptance criterion.
-    const has_dmabuf = std.mem.indexOf(u8, target_str, "dmabuf") != null;
-    if (!has_dmabuf) {
-        std.debug.print("[dmabuf test] FAIL: target '{s}' does not contain 'dmabuf'\n", .{target_str});
+    // Only say anything when it fails: the build runner reads a test's stderr
+    // as trouble, so a passing run that logs looks like a failing one.
+    if (std.mem.indexOf(u8, target_str, "dmabuf") == null) {
+        std.debug.print("exported fd links to '{s}', which is not a dma-buf\n", .{target_str});
+        return error.NotADmaBuf;
     }
-    try std.testing.expect(has_dmabuf);
 
     // Close the dma-buf fd. The mapping defer runs after this at scope end,
     // which is correct: mapping must outlive the dma-buf consumer (this test).
