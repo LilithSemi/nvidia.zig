@@ -115,6 +115,38 @@ pub const Transport = struct {
         }
     }
 
+    /// NV_ESC_RM_DUP_OBJECT (NVOS55): dup `h_object_src` (owned by client
+    /// `h_client_src`) into a new object `h_new` under `h_client`/`h_parent`.
+    /// The dup shares the same underlying resource as the source. For a
+    /// memory object that is the same physical pages, so writes through either
+    /// handle land in the same place. Returns the actual new handle.
+    pub fn dupObject(
+        self: *Transport,
+        h_client: sdk.NvHandle,
+        h_parent: sdk.NvHandle,
+        h_new: sdk.NvHandle,
+        h_client_src: sdk.NvHandle,
+        h_object_src: sdk.NvHandle,
+    ) Error!sdk.NvHandle {
+        var p = sdk.Os55Params{
+            .h_client = h_client,
+            .h_parent = h_parent,
+            .h_object = h_new,
+            .h_client_src = h_client_src,
+            .h_object_src = h_object_src,
+            .flags = sdk.NV04_DUP_HANDLE_FLAGS_NONE,
+            .status = 0,
+        };
+        const req = ioctl.iowr(ioctl.NV_ESC_RM_DUP_OBJECT, sdk.Os55Params);
+        const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&p));
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.IoctlFailed,
+        }
+        if (p.status != 0) return error.RmAllocFailed;
+        return p.h_object;
+    }
+
     /// NV_ESC_RM_FREE: free an RM object.
     pub fn rmFree(self: *Transport, h_root: sdk.NvHandle, h_parent: sdk.NvHandle, h_object: sdk.NvHandle) void {
         var p = sdk.Os00Params{ .h_root = h_root, .h_object_parent = h_parent, .h_object_old = h_object, .status = 0 };
@@ -132,6 +164,16 @@ pub const Transport = struct {
             else => return error.IoctlFailed,
         }
         return cards;
+    }
+
+    /// How many GPUs the driver knows about (the valid entries of CARD_INFO).
+    pub fn deviceCount(self: *Transport) Error!u32 {
+        const cards = try self.cardInfo();
+        var count: u32 = 0;
+        for (cards) |entry| {
+            if (entry.valid != 0) count += 1;
+        }
+        return count;
     }
 
     /// NV_ESC_ATTACH_GPUS_TO_FD: attach a GPU (by gpu_id) to the control fd. The

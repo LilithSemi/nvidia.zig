@@ -71,6 +71,24 @@ pub const Os00Params = extern struct {
     h_object_old: NvHandle,
     status: NvV32,
 };
+/// NVOS55_PARAMETERS (nvos.h): the NV_ESC_RM_DUP_OBJECT (NV04_DUP_OBJECT)
+/// parameter block. Dups `hObjectSrc` (owned by `hClientSrc`) into a new
+/// object under `hClient`/`hParent`, which shares the same underlying
+/// resource. It hands a memory object from one RM client to another with no
+/// copy.
+/// used to hand a memory object from one RM client to another with no copy.
+pub const Os55Params = extern struct {
+    h_client: NvHandle, // destination client
+    h_parent: NvHandle, // parent of the new object
+    h_object: NvHandle, // in: requested handle, out: the actual one
+    h_client_src: NvHandle,
+    h_object_src: NvHandle,
+    flags: NvU32,
+    status: NvV32,
+};
+
+/// NV04_DUP_HANDLE_FLAGS_NONE (nvos.h).
+pub const NV04_DUP_HANDLE_FLAGS_NONE: NvU32 = 0;
 
 /// NVOS21_PARAMETERS (nvos.h): the NV_ESC_RM_ALLOC (NV04_ALLOC) parameter block.
 pub const Os21Params = extern struct {
@@ -218,6 +236,59 @@ pub const GpuGetNameStringParams = extern struct {
     flags: NvU32 = 0, // 0 = ASCII
     ascii: [GPU_NAME_MAX_LENGTH]u8 = [_]u8{0} ** GPU_NAME_MAX_LENGTH,
 };
+
+/// NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2 (ctrl0000system.h): the V2 form of
+/// the P2P caps query. Use this one, not the deprecated V1 (0x127). V1 carries
+/// an NvP64 pointer field that V2 replaced with plain NvU32s, which is why V2
+/// is the one that fits a fixed-layout extern struct cleanly.
+pub const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2: NvU32 = 0x12b;
+
+/// NV0000_CTRL_SYSTEM_GET_P2P_CAPS_V2_PARAMS (ctrl0000system.h).
+pub const P2pCapsV2Params = extern struct {
+    gpu_ids: [MAX_ATTACHED_GPUS]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS,
+    gpu_count: NvU32 = 0,
+    p2p_caps: NvU32 = 0,
+    p2p_optimal_read_ces: NvU32 = 0,
+    p2p_optimal_write_ces: NvU32 = 0,
+    p2p_caps_status: [CAPS_STATUS_TABLE_SIZE]NvU8 = [_]NvU8{0} ** CAPS_STATUS_TABLE_SIZE,
+    bus_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS_SQUARED,
+    bus_egm_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS_SQUARED,
+
+    pub const MAX_ATTACHED_GPUS = 32; // NV0000_CTRL_SYSTEM_MAX_ATTACHED_GPUS
+    pub const MAX_ATTACHED_GPUS_SQUARED = 1024; // NV0000_CTRL_SYSTEM_MAX_ATTACHED_GPUS_SQUARED
+    pub const CAPS_STATUS_TABLE_SIZE = 9; // NV0000_CTRL_P2P_CAPS_INDEX_TABLE_SIZE
+};
+
+/// p2pCaps bit positions (NV0000_CTRL_SYSTEM_GET_P2P_CAPS_*_SUPPORTED).
+pub const p2p_caps = struct {
+    pub const WRITES: NvU32 = 1 << 0;
+    pub const READS: NvU32 = 1 << 1;
+    pub const PROP: NvU32 = 1 << 2;
+    pub const NVLINK: NvU32 = 1 << 3;
+    pub const ATOMICS: NvU32 = 1 << 4;
+    pub const LOOPBACK: NvU32 = 1 << 5;
+    pub const PCI: NvU32 = 1 << 6;
+    pub const INDIRECT_WRITES: NvU32 = 1 << 7;
+    pub const INDIRECT_READS: NvU32 = 1 << 8;
+    pub const INDIRECT_ATOMICS: NvU32 = 1 << 9;
+};
+
+/// p2pCapsStatus table indices (NV0000_CTRL_P2P_CAPS_INDEX_*).
+pub const p2p_caps_status_index = struct {
+    pub const READ = 0;
+    pub const WRITE = 1;
+    pub const NVLINK = 2;
+    pub const ATOMICS = 3;
+    pub const PROP = 4;
+    pub const LOOPBACK = 5;
+    pub const PCI = 6;
+    pub const C2C = 7;
+    pub const PCI_BAR1 = 8;
+};
+
+/// NV0000_P2P_CAPS_STATUS_OK: the capability at this table index is supported.
+/// Any other value names a reason it is not (chipset, GPU, topology, regkey).
+pub const P2P_CAPS_STATUS_OK: NvU8 = 0;
 
 /// NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (cl0070.h): pAllocParms for
 /// NV01_MEMORY_VIRTUAL - reserves a GPU VA range [offset, limit] in a VA space.
@@ -480,6 +551,19 @@ test "RM struct layouts match the NVIDIA ABI" {
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(ChannelAllocParams, "userd_offset"));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(ChannelBindParams));
     try std.testing.expectEqual(@as(usize, 3), @sizeOf(GpfifoScheduleParams));
+    try std.testing.expectEqual(@as(usize, 28), @sizeOf(Os55Params));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(Os55Params, "h_client_src"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(Os55Params, "status"));
+    // A wrong size or offset here is a silent garbage read past the kernel's
+    // own struct, since NV_ESC_RM_DUP_OBJECT/GET_P2P_CAPS_V2 trust params_size.
+    try std.testing.expectEqual(@as(usize, 8348), @sizeOf(P2pCapsV2Params));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(P2pCapsV2Params, "gpu_count"));
+    try std.testing.expectEqual(@as(usize, 140), @offsetOf(P2pCapsV2Params, "p2p_optimal_write_ces"));
+    // p2p_caps_status is a [9]u8 at 144; bus_peer_ids needs 4-byte alignment,
+    // so 3 bytes of padding sit between them (144+9=153, rounded up to 156).
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(P2pCapsV2Params, "p2p_caps_status"));
+    try std.testing.expectEqual(@as(usize, 156), @offsetOf(P2pCapsV2Params, "bus_peer_ids"));
+    try std.testing.expectEqual(@as(usize, 4252), @offsetOf(P2pCapsV2Params, "bus_egm_peer_ids"));
 }
 
 test "GPFIFO submission encodings" {

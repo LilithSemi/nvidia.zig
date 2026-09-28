@@ -324,6 +324,19 @@ pub const Buffer = struct {
     }
 };
 
+/// A peer allocation this runner can address. The bytes live on the other
+/// runner's device, so there is no CPU mapping, except when the underlying
+/// memory is host RAM, where `importPeer` maps it to the CPU anyway so
+/// `copyFromPeer` can reach it with a memcpy (see the timings above that
+/// function). `va` is a normal address in THIS runner's own GPU VA space:
+/// importPeer already mapped the dup there, so a copy-engine transfer needs
+/// no cross-address-space handling at all.
+pub const Peer = struct {
+    va: u64,
+    size: u64,
+    memory: rm.Memory,
+};
+
 /// The transfer size at which the copy engine overtakes the inline path on this
 /// hardware. Below it, put the payload in the pushbuffer with
 /// `Stream.uploadInline`; above it, hand the copy engine a source buffer with
@@ -350,6 +363,31 @@ pub const inline_upload_limit_bytes: u32 = 16 * 1024;
 /// the copy engine.
 pub fn preferInlineUpload(bytes: u32) bool {
     return bytes < inline_upload_limit_bytes;
+}
+
+/// Which path `Runner.copyFromPeer` should take, by where the two allocations
+/// live. On an RTX 5070 on 2026-09-27, nanoseconds per transfer
+/// (memcpy vs the copy engine, system<->system and VRAM<->VRAM, submission and
+/// fence included for the copy engine column):
+///
+///     bytes    | system memcpy | system CE |   VRAM memcpy* |  VRAM CE
+///       4096   |         146   |    11076  |       438555   |    9214
+///      65536   |        1746   |    20608  |      6988728   |   10880
+///    1048576   |       77302   |   183415  |    137900445   |   41574
+///
+/// *the VRAM memcpy column reads a scratch BAR1 CPU mapping made only for
+/// this measurement. copyFromPeer never maps VRAM to the CPU on the real
+/// path, since the copy engine already reaches it directly.
+///
+/// System memory needs no submission at all for a memcpy, so it wins across
+/// the whole range, by two orders of magnitude at every size. VRAM
+/// inverts it even harder than expected: the BAR1 CPU read is not merely
+/// slower than the copy engine's own submission, it is 15x to 3300x slower,
+/// climbing fast with size (a 1 MiB BAR1 read takes 138 ms, against 42 us on
+/// the copy engine). Both halves of the rule hold decisively; neither needed
+/// a threshold, only a location check.
+pub fn preferMemcpyForPeerCopy(dst_location: rm.Memory.Location, src_location: rm.Memory.Location) bool {
+    return dst_location != .vram and src_location != .vram;
 }
 
 /// A ready-to-use compute context: a GPFIFO channel bound to the compute class,
@@ -408,9 +446,28 @@ pub const Runner = struct {
     /// `error.SkipZigTest` when no GPU is reachable, so tests skip instead of
     /// failing on a machine without one.
     pub fn init() !Runner {
+        return initOn(0) catch |err| switch (err) {
+            // The faults `allocDevice` reports for GPU 0 all mean one thing to a caller
+            // that wants any GPU at all: there is not one here. Every test in this file
+            // depends on that, so keep it a skip. `initOn` reports them as real errors,
+            // because a caller that names an ordinal asks about one specific device.
+            error.NoDevice,
+            error.OpenFailed,
+            error.IoctlFailed,
+            error.RmAllocFailed,
+            => error.SkipZigTest,
+            else => err,
+        };
+    }
+
+    /// Like `init`, but on the `ordinal`-th GPU the driver knows about
+    /// (`rm.Client.deviceCount`). Only a completely unreachable driver skips
+    /// the test; a bad ordinal on a reachable driver is a real, reportable
+    /// error (`error.NoDevice`), not a skip.
+    pub fn initOn(ordinal: u32) !Runner {
         var client = rm.Client.open() catch return error.SkipZigTest;
         errdefer client.deinit();
-        const dev = client.allocDevice(0) catch return error.SkipZigTest;
+        const dev = try client.allocDevice(ordinal);
         errdefer client.freeDevice(dev);
         const vaspace = try client.allocVaSpace(dev);
 
@@ -534,6 +591,33 @@ pub const Runner = struct {
         return error.CopyTimeout;
     }
 
+    /// Copy `bytes` from `src_offset` in an imported peer allocation into
+    /// `dst_offset` in one of this runner's buffers, by the fastest path for
+    /// where the two allocations live (`preferMemcpyForPeerCopy` above, and
+    /// the numbers behind it). `dst_offset`/`bytes` and `src_offset`/`bytes`
+    /// are checked against `dst.bytes.len` and `src.size`: both come from a
+    /// runtime transfer request, not a value the caller chose in source, so
+    /// they are never trusted.
+    pub fn copyFromPeer(self: *Runner, dst: Buffer, dst_offset: u32, src: Peer, src_offset: u32, bytes: u32) !void {
+        const dst_end = std.math.add(u64, @as(u64, dst_offset), @as(u64, bytes)) catch
+            return error.OutOfBounds;
+        if (dst_end > @as(u64, dst.bytes.len)) return error.OutOfBounds;
+        const src_end = std.math.add(u64, @as(u64, src_offset), @as(u64, bytes)) catch
+            return error.OutOfBounds;
+        if (src_end > src.size) return error.OutOfBounds;
+
+        if (preferMemcpyForPeerCopy(dst.memory.location, src.memory.location)) {
+            const index = self.findAllocation(src.memory) orelse unreachable;
+            // importPeer only leaves this null for a VRAM peer, and
+            // preferMemcpyForPeerCopy already ruled that out above.
+            const mapping = self.allocations[index].cpu_mapping orelse unreachable;
+            const source: []const volatile u8 = mapping.bytes[@as(usize, src_offset)..][0..bytes];
+            @memcpy(dst.bytes[@as(usize, dst_offset)..][0..bytes], source);
+            return;
+        }
+        try self.copyLinear(dst.va + @as(u64, dst_offset), src.va + @as(u64, src_offset), bytes);
+    }
+
     pub fn deinit(self: *Runner) void {
         self.releaseOwnedResources();
         self.client.freeDevice(self.dev);
@@ -594,6 +678,17 @@ pub const Runner = struct {
         return memory;
     }
 
+    /// Dup `memory` (owned by `src`, a different Runner and a different RM
+    /// client) into this Runner's own client, tracked through the same
+    /// bookkeeping `allocMemory` uses.
+    fn dupMemoryFrom(self: *Runner, src: *Runner, memory: rm.Memory) !rm.Memory {
+        if (self.allocation_count == MAX_ALLOCATIONS) return error.RunnerAllocationLimit;
+        const dup = try self.client.dupMemory(self.dev, src.dev, memory);
+        errdefer self.client.freeMemory(self.dev, dup);
+        try self.trackMemory(dup);
+        return dup;
+    }
+
     fn allocUsermodeMemory(self: *Runner) !rm.Memory {
         if (self.allocation_count == MAX_ALLOCATIONS) return error.RunnerAllocationLimit;
         const handle = try self.client.allocUsermode(self.dev, sdk.BLACKWELL_USERMODE_A);
@@ -649,6 +744,31 @@ pub const Runner = struct {
     /// invalid when this function returns.
     pub fn freeBuffer(self: *Runner, buffer: Buffer) void {
         const index = self.findAllocation(buffer.memory) orelse unreachable;
+        self.releaseAllocation(index);
+    }
+
+    /// Dup `buffer` (owned by `src`, a different Runner on a different RM
+    /// client, possibly a different GPU) into this Runner and map it into
+    /// this Runner's own GPU VA space. The result addresses the same physical
+    /// memory as `buffer`, and nothing is copied. Release with `releasePeer`.
+    ///
+    /// Host memory also gets a CPU mapping here (VRAM does not, see `Peer`),
+    /// tracked through the same bookkeeping `alloc` uses. That is why
+    /// `releasePeer` needs no separate cleanup path: `releaseAllocation`
+    /// already unmaps whatever is present and rmFrees the dup in this
+    /// client, and never touches `src`'s own allocation.
+    pub fn importPeer(self: *Runner, src: *Runner, buffer: Buffer) !Peer {
+        const dup = try self.dupMemoryFrom(src, buffer.memory);
+        errdefer self.releaseAllocation(self.findAllocation(dup) orelse unreachable);
+        const va = self.takeVa(dup.size);
+        const mapping = try self.mapToGpu(dup, va);
+        if (dup.location != .vram) _ = try self.mapToCpu(dup);
+        return .{ .va = mapping.gpu_va, .size = dup.size, .memory = dup };
+    }
+
+    /// Release a Peer returned by `importPeer`.
+    pub fn releasePeer(self: *Runner, imported: Peer) void {
+        const index = self.findAllocation(imported.memory) orelse unreachable;
         self.releaseAllocation(index);
     }
 
@@ -735,6 +855,221 @@ test "live: freeBuffer releases its tracked CPU and GPU mappings" {
     runner.freeBuffer(buffer);
     try std.testing.expectEqual(allocation_count, runner.allocation_count);
     try std.testing.expect(runner.findAllocation(buffer.memory) == null);
+}
+
+test "live: initOn a nonexistent ordinal gives a clean error, not a crash" {
+    // Only a completely unreachable driver is worth skipping; this box has a
+    // real GPU, so `count` names an ordinal one past the last valid one.
+    var probe = rm.Client.open() catch return error.SkipZigTest;
+    const count = probe.deviceCount() catch {
+        probe.deinit();
+        return error.SkipZigTest;
+    };
+    probe.deinit();
+    try std.testing.expectError(error.NoDevice, Runner.initOn(count));
+}
+
+/// Fill `words` dwords of `buf` with a pattern that depends on the index, so
+/// a wrong VA (garbage or all zero) or a half copy (a correct prefix and a
+/// stale/zero tail) both show up as a mismatch somewhere in the range.
+fn fillIndexPattern(buf: []u32, words: usize, seed: u32) void {
+    for (buf[0..words], 0..) |*w, i| w.* = seed +% @as(u32, @intCast(i)) *% 2654435761;
+}
+
+fn expectIndexPattern(buf: Buffer, words: usize, seed: u32) !void {
+    for (0..words) |i| {
+        const want = seed +% @as(u32, @intCast(i)) *% 2654435761;
+        try std.testing.expectEqual(want, buf.read(u32, i));
+    }
+}
+
+test "live: importPeer + copyFromPeer takes the memcpy arm for host memory" {
+    var a = try Runner.init();
+    defer a.deinit();
+    var b = try Runner.init();
+    defer b.deinit();
+
+    const words = 4096; // 16 KiB
+    const src_buf = try a.alloc(.system, words * 4);
+    defer a.freeBuffer(src_buf);
+    const dst_buf = try b.alloc(.system, words * 4);
+    defer b.freeBuffer(dst_buf);
+    fillIndexPattern(src_buf.slice(u32), words, 0xBEEF_0000);
+
+    const peer = try b.importPeer(&a, src_buf);
+    defer b.releasePeer(peer);
+    try std.testing.expect(preferMemcpyForPeerCopy(dst_buf.memory.location, peer.memory.location));
+
+    try b.copyFromPeer(dst_buf, 0, peer, 0, words * 4);
+    try expectIndexPattern(dst_buf, words, 0xBEEF_0000);
+}
+
+test "live: importPeer + copyFromPeer takes the copy-engine arm for VRAM" {
+    var a = try Runner.init();
+    defer a.deinit();
+    var b = try Runner.init();
+    defer b.deinit();
+
+    const words = 4096; // 16 KiB
+    const src_buf = try a.alloc(.vram, words * 4);
+    defer a.freeBuffer(src_buf);
+    const dst_buf = try b.alloc(.vram, words * 4);
+    defer b.freeBuffer(dst_buf);
+    fillIndexPattern(src_buf.slice(u32), words, 0xFACE_0000);
+
+    const peer = try b.importPeer(&a, src_buf);
+    defer b.releasePeer(peer);
+    try std.testing.expect(!preferMemcpyForPeerCopy(dst_buf.memory.location, peer.memory.location));
+
+    try b.copyFromPeer(dst_buf, 0, peer, 0, words * 4);
+    try expectIndexPattern(dst_buf, words, 0xFACE_0000);
+}
+
+test "live: copyFromPeer applies dst_offset and src_offset to the correct side" {
+    var a = try Runner.init();
+    defer a.deinit();
+    var b = try Runner.init();
+    defer b.deinit();
+
+    const words = 4096; // 16 KiB
+    const src_words_offset = 7;
+    const dst_words_offset = 13;
+    const copy_words = words - 32;
+
+    const src_buf = try a.alloc(.system, words * 4);
+    defer a.freeBuffer(src_buf);
+    const dst_buf = try b.alloc(.system, words * 4);
+    defer b.freeBuffer(dst_buf);
+    // Two distinct seeds so a source-side offset and a destination-side offset
+    // applied to the wrong side would read or land on the wrong bytes instead
+    // of merely shifting the same pattern.
+    fillIndexPattern(src_buf.slice(u32), words, 0xA5A5_0000);
+    fillIndexPattern(dst_buf.slice(u32), words, 0x5A5A_0000);
+
+    const peer = try b.importPeer(&a, src_buf);
+    defer b.releasePeer(peer);
+    try b.copyFromPeer(
+        dst_buf,
+        dst_words_offset * 4,
+        peer,
+        src_words_offset * 4,
+        copy_words * 4,
+    );
+
+    const dst_words = dst_buf.slice(u32);
+    for (0..dst_words_offset) |i| {
+        const want = 0x5A5A_0000 +% @as(u32, @intCast(i)) *% 2654435761;
+        try std.testing.expectEqual(want, dst_words[i]);
+    }
+    for (0..copy_words) |i| {
+        const want = 0xA5A5_0000 +% @as(u32, @intCast(src_words_offset + i)) *% 2654435761;
+        try std.testing.expectEqual(want, dst_words[dst_words_offset + i]);
+    }
+    for (dst_words_offset + copy_words..words) |i| {
+        const want = 0x5A5A_0000 +% @as(u32, @intCast(i)) *% 2654435761;
+        try std.testing.expectEqual(want, dst_words[i]);
+    }
+}
+
+test "live: copyFromPeer rejects a destination range past the buffer" {
+    var a = try Runner.init();
+    defer a.deinit();
+    var b = try Runner.init();
+    defer b.deinit();
+
+    const src_buf = try a.alloc(.system, 0x1000);
+    defer a.freeBuffer(src_buf);
+    const dst_buf = try b.alloc(.system, 0x1000);
+    defer b.freeBuffer(dst_buf);
+    const peer = try b.importPeer(&a, src_buf);
+    defer b.releasePeer(peer);
+
+    try std.testing.expectError(
+        error.OutOfBounds,
+        b.copyFromPeer(dst_buf, @intCast(dst_buf.bytes.len), peer, 0, 4),
+    );
+    try std.testing.expectError(
+        error.OutOfBounds,
+        b.copyFromPeer(dst_buf, 0, peer, @intCast(peer.size), 4),
+    );
+}
+
+/// Time `iters` memcpys of `bytes` bytes from `src` to `dst`.
+fn timeMemcpy(dst: []u8, src: []const volatile u8, bytes: usize, iters: usize) u64 {
+    @memcpy(dst[0..bytes], src[0..bytes]); // warm the path
+    var start: std.Io.Timestamp = .now(std.testing.io, .awake);
+    for (0..iters) |_| @memcpy(dst[0..bytes], src[0..bytes]);
+    return @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters));
+}
+
+/// Time `iters` copy-engine transfers of `bytes` bytes.
+fn timeCopyLinear(r: *Runner, dst_va: u64, src_va: u64, bytes: u32, iters: usize) !u64 {
+    try r.copyLinear(dst_va, src_va, bytes); // warm the path
+    var start: std.Io.Timestamp = .now(std.testing.io, .awake);
+    for (0..iters) |_| try r.copyLinear(dst_va, src_va, bytes);
+    return @intCast(@divTrunc(start.durationTo(.now(std.testing.io, .awake)).nanoseconds, iters));
+}
+
+test "live: a host memcpy beats the copy engine, and a BAR1 read loses to it" {
+    var a = try Runner.init();
+    defer a.deinit();
+    var b = try Runner.init();
+    defer b.deinit();
+
+    const sizes = [_]u32{ 4 * 1024, 64 * 1024, 1024 * 1024 };
+    // A BAR1 memcpy at 1 MiB alone takes hundreds of milliseconds, so this takes
+    // fewer samples than the 200 elsewhere in this file. The two paths differ by
+    // orders of magnitude, so few samples still separate them.
+    const iters = 20;
+    for (sizes) |size| {
+        const sys_src = try a.alloc(.system, size);
+        defer a.freeBuffer(sys_src);
+        const sys_dst = try b.alloc(.system, size);
+        defer b.freeBuffer(sys_dst);
+        const sys_peer = try b.importPeer(&a, sys_src);
+        defer b.releasePeer(sys_peer);
+        const sys_peer_index = b.findAllocation(sys_peer.memory) orelse unreachable;
+        const sys_peer_bytes = b.allocations[sys_peer_index].cpu_mapping.?.bytes;
+        const sys_memcpy_ns = timeMemcpy(sys_dst.bytes, sys_peer_bytes, size, iters);
+        const sys_ce_ns = try timeCopyLinear(&b, sys_dst.va, sys_peer.va, size, iters);
+        // Host memory pays no submission at all for a memcpy, and submission is
+        // most of a small transfer, so the memcpy has to win at every size here.
+        if (sys_memcpy_ns >= sys_ce_ns) {
+            std.debug.print(
+                "{d} B in host memory: memcpy {d} ns, copy engine {d} ns\n",
+                .{ size, sys_memcpy_ns, sys_ce_ns },
+            );
+            return error.HostMemcpyNoLongerWins;
+        }
+
+        const vram_src = try a.alloc(.vram, size);
+        defer a.freeBuffer(vram_src);
+        const vram_dst = try b.alloc(.vram, size);
+        defer b.freeBuffer(vram_dst);
+        const vram_peer = try b.importPeer(&a, vram_src);
+        defer b.releasePeer(vram_peer);
+        // A scratch BAR1 CPU mapping, made only to time the path this rejects.
+        // The real copyFromPeer never maps VRAM to the CPU, see `Peer`.
+        const scratch = try b.client.mapMemory(b.dev, vram_peer.memory);
+        defer b.client.unmapMemory(scratch);
+        const vram_memcpy_ns = timeMemcpy(vram_dst.bytes, scratch.bytes, size, iters);
+        const vram_ce_ns = try timeCopyLinear(&b, vram_dst.va, vram_peer.va, size, iters);
+        // A CPU read of VRAM goes through the BAR1 window uncached, which costs
+        // far more than the copy engine's whole submission.
+        if (vram_memcpy_ns <= vram_ce_ns) {
+            std.debug.print(
+                "{d} B in VRAM: BAR1 memcpy {d} ns, copy engine {d} ns\n",
+                .{ size, vram_memcpy_ns, vram_ce_ns },
+            );
+            return error.Bar1ReadNoLongerLoses;
+        }
+    }
+    // And the path choice has to sit where the timings put it.
+    try std.testing.expect(preferMemcpyForPeerCopy(.system, .system));
+    try std.testing.expect(preferMemcpyForPeerCopy(.system, .system_wc));
+    try std.testing.expect(!preferMemcpyForPeerCopy(.vram, .vram));
+    try std.testing.expect(!preferMemcpyForPeerCopy(.system, .vram));
+    try std.testing.expect(!preferMemcpyForPeerCopy(.vram, .system));
 }
 
 test "live: integer ALU (IADD3, IMAD, IMAD.WIDE, ISETP, SEL) computes on the SMs" {

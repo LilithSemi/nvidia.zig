@@ -354,6 +354,34 @@ pub const Transport = struct {
         self.untrack(h_object);
     }
 
+    /// No CARD_INFO analog on baremetal, because there is no kernel node to enumerate
+    /// through. This HAL always addresses exactly the one GPU it was booted
+    /// against.
+    pub fn deviceCount(self: *Transport) Error!u32 {
+        if (!self.booted) return error.NotImplemented;
+        return 1;
+    }
+
+    /// NV_ESC_RM_DUP_OBJECT has no GSP RPC form yet, so cross-client memory
+    /// duping (the peer-transfer path) is Linux-only for now. Kept
+    /// syntactically valid so rm.zig compiles against either transport.
+    pub fn dupObject(
+        self: *Transport,
+        h_client: sdk.NvHandle,
+        h_parent: sdk.NvHandle,
+        h_new: sdk.NvHandle,
+        h_client_src: sdk.NvHandle,
+        h_object_src: sdk.NvHandle,
+    ) Error!sdk.NvHandle {
+        _ = self;
+        _ = h_client;
+        _ = h_parent;
+        _ = h_new;
+        _ = h_client_src;
+        _ = h_object_src;
+        return error.NotImplemented;
+    }
+
     // =======================================================================
     // allocDevice -> the ROOT / DEVICE / SUBDEVICE alloc sequence over RPC. Mirrors
     // linux.zig allocDevice's order + the sdk params it passes (only the registration
@@ -916,6 +944,8 @@ test "freestanding open() without metal inputs fails cleanly" {
     var t = Transport{};
     try testing.expectError(error.NotImplemented, t.rmAlloc(0, 0, 1, sdk.NV01_ROOT, null, 0));
     try testing.expectError(error.NotImplemented, t.allocDevice(0));
+    try testing.expectError(error.NotImplemented, t.deviceCount());
+    try testing.expectError(error.NotImplemented, t.dupObject(0, 0, 1, 0, 0));
 }
 
 test {

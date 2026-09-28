@@ -74,6 +74,12 @@ pub const Client = struct {
         self.t.rmFree(h_root, h_parent, h_object);
     }
 
+    /// How many GPUs the driver knows about (the valid entries of CARD_INFO).
+    /// A valid `index` for allocDevice is `0..deviceCount()`.
+    pub fn deviceCount(self: *Client) Error!u32 {
+        return self.t.deviceCount();
+    }
+
     /// Bring up the `index`-th GPU end to end: register its node, attach it,
     /// then allocate the root client, device, and subdevice. The full sequence
     /// required by the open kernel modules.
@@ -183,6 +189,18 @@ pub const Client = struct {
         self.t.rmFree(dev.client, dev.device, mem.handle);
     }
 
+    /// Dup `memory` (owned by `src`'s client) into `dst`'s client, so `dst`
+    /// can map and use it the same as memory it allocated itself. The dup
+    /// shares the same physical pages as the original. It is a handle to
+    /// the same resource, not a copy, so a write through either side is
+    /// visible through the other. Free the returned Memory with freeMemory on
+    /// `dst`; that only drops this client's handle and never touches `src`'s
+    /// own allocation.
+    pub fn dupMemory(self: *Client, dst: Device, src: Device, memory: Memory) Error!Memory {
+        const handle = try self.t.dupObject(dst.client, dst.device, self.t.newHandle(), src.client, memory.handle);
+        return .{ .handle = handle, .size = memory.size, .location = memory.location };
+    }
+
     /// CPU-map a memory object: NV_ESC_RM_MAP_MEMORY sets up an mmap context on a
     /// dedicated fd, then mmap returns the pointer. System memory maps via the
     /// control node, VRAM via the device node. Supports many concurrent mappings.
@@ -217,6 +235,69 @@ pub const Client = struct {
         const n = @min(end, buf.len);
         @memcpy(buf[0..n], p.ascii[0..n]);
         return buf[0..n];
+    }
+
+    /// Decoded NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2 result for one GPU pair.
+    /// `status_ok` is true only when every entry in the kernel's status table
+    /// reads NV0000_P2P_CAPS_STATUS_OK. False means at least one of the caps
+    /// bits above was refused by chipset, topology, or a regkey rather than
+    /// genuinely supported.
+    pub const P2pCaps = struct {
+        writes: bool,
+        reads: bool,
+        prop: bool,
+        nvlink: bool,
+        atomics: bool,
+        loopback: bool,
+        pci: bool,
+        indirect_writes: bool,
+        indirect_reads: bool,
+        indirect_atomics: bool,
+        optimal_read_ces: sdk.NvU32,
+        optimal_write_ces: sdk.NvU32,
+        status_ok: bool,
+        /// The raw per-capability status table (sdk.p2p_caps_status_index
+        /// names the entries): sdk.P2P_CAPS_STATUS_OK, or a reason code for
+        /// why that one capability was refused.
+        status: [sdk.P2pCapsV2Params.CAPS_STATUS_TABLE_SIZE]sdk.NvU8,
+    };
+
+    /// Query the P2P capabilities between `a` and `b` (NV0000_CTRL_CMD_
+    /// SYSTEM_GET_P2P_CAPS_V2, on `a`'s root client). `a` and `b` may be the
+    /// same Device, which needs only one GPU to reach, but do not read that
+    /// answer as "what this GPU can do with itself": a single RTX 5070 with no
+    /// peer fabric refuses every capability, loopback included. Use this to
+    /// learn about a real pair. For two runners on one GPU use
+    /// `Runner.importPeer`, which is a handle dup and needs no P2P capability.
+    pub fn p2pCaps(self: *Client, a: Device, b: Device) Error!P2pCaps {
+        var p = sdk.P2pCapsV2Params{};
+        p.gpu_ids[0] = a.gpu_id;
+        p.gpu_ids[1] = b.gpu_id;
+        p.gpu_count = 2;
+        try self.control(a, a.client, sdk.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2, &p, @sizeOf(sdk.P2pCapsV2Params));
+
+        const caps = p.p2p_caps;
+        const bit = sdk.p2p_caps;
+        var status_ok = true;
+        for (p.p2p_caps_status) |entry| {
+            if (entry != sdk.P2P_CAPS_STATUS_OK) status_ok = false;
+        }
+        return .{
+            .writes = caps & bit.WRITES != 0,
+            .reads = caps & bit.READS != 0,
+            .prop = caps & bit.PROP != 0,
+            .nvlink = caps & bit.NVLINK != 0,
+            .atomics = caps & bit.ATOMICS != 0,
+            .loopback = caps & bit.LOOPBACK != 0,
+            .pci = caps & bit.PCI != 0,
+            .indirect_writes = caps & bit.INDIRECT_WRITES != 0,
+            .indirect_reads = caps & bit.INDIRECT_READS != 0,
+            .indirect_atomics = caps & bit.INDIRECT_ATOMICS != 0,
+            .optimal_read_ces = p.p2p_optimal_read_ces,
+            .optimal_write_ces = p.p2p_optimal_write_ces,
+            .status_ok = status_ok,
+            .status = p.p2p_caps_status,
+        };
     }
 
     /// Allocate a GPU virtual address space (FERMI_VASPACE_A) under the device.
@@ -491,6 +572,44 @@ test "live: RM_CONTROL queries GPU id and name" {
     var buf: [64]u8 = undefined;
     const name = try c.getGpuName(dev, &buf);
     try std.testing.expect(name.len > 0);
+}
+
+test "live: deviceCount reports the GPUs the driver knows about" {
+    var c = try openOrSkip();
+    defer c.deinit();
+    const count = try c.deviceCount();
+    try std.testing.expect(count >= 1);
+    // A valid index is always reachable up to the reported count.
+    const dev = c.allocDevice(count - 1) catch |e| switch (e) {
+        error.OpenFailed, error.NoDevice => return error.SkipZigTest,
+        else => return e,
+    };
+    c.freeDevice(dev);
+}
+
+test "live: p2pCaps against itself proves the struct layout, decoded" {
+    var c = try openOrSkip();
+    defer c.deinit();
+    const dev = c.allocDevice(0) catch |e| switch (e) {
+        error.OpenFailed, error.NoDevice => return error.SkipZigTest,
+        else => return e,
+    };
+    defer c.freeDevice(dev);
+
+    // The call succeeding at all is the acceptance criterion: NVOS54 only
+    // returns without error when the kernel's own status field came back 0,
+    // which only happens when it accepted this struct's exact layout.
+    //
+    // On a one-GPU box the answer is every capability false, status_ok
+    // false, and a status table of CHIPSET_NOT_SUPPORTED / NOT_SUPPORTED
+    // (the table reads {1, 1, 5, 5, 5, 5, 5, 5, 5}). A single GPU with no NVLink
+    // fabric has no peer to reach, not even itself, so the RM refuses every
+    // entry instead of granting a trivial loopback. Duping a memory object
+    // between two clients on this one GPU (see Runner.importPeer) is a
+    // separate RM primitive and does not depend on this capability at all.
+    const caps = try c.p2pCaps(dev, dev);
+    try std.testing.expect(!caps.status_ok);
+    for (caps.status) |entry| try std.testing.expect(entry != sdk.P2P_CAPS_STATUS_OK);
 }
 
 test "live: allocate a GPU VA space (channel prerequisite)" {
