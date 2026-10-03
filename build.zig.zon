@@ -9,8 +9,8 @@
             .hash = "uefi-0.1.0-1okz4b5QAAD-ImP4Q86o97td2DpQNfFhltlBjgnLdL8X",
         },
         .conduit = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/conduit.git#cb9b7130b72b71001cb4347e11b0b383c0fbcdc4",
-            .hash = "conduit-0.1.0-R_mFrINUBQDxhZBhJcDJ9Jxw0Wsxo3iTZl6rKdR-o7QF",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/conduit.git#b7899bf1f025ef2f8d20976d8e7d32d445c684ec",
+            .hash = "conduit-0.1.0-R_mFrIdUBQD4Uo3q3o39oVSC6BI7d0vDWdnqNdJwyhX2",
         },
     },
     .paths = .{ "build.zig.zon", "build.zig", "src", "examples" },
