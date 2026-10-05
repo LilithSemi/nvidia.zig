@@ -586,9 +586,9 @@ pub fn buildBootArgs(
     const args_pa = try sysmem.alloc(@sizeOf(proto.GspArgumentsCached));
 
     const L = proto.LibosMemoryRegionInitArgument;
-    const sysmem_loc = @intFromEnum(proto.LibosMemoryRegionLoc.sysmem);
-    const contig = @intFromEnum(proto.LibosMemoryRegionKind.contiguous);
-    const radix3_kind = @intFromEnum(proto.LibosMemoryRegionKind.radix3);
+    const sysmem_loc = @backingInt(proto.LibosMemoryRegionLoc.sysmem);
+    const contig = @backingInt(proto.LibosMemoryRegionKind.contiguous);
+    const radix3_kind = @backingInt(proto.LibosMemoryRegionKind.radix3);
 
     var regions: [LIBOS_REGION_COUNT]L = undefined;
     regions[0] = .{ .id8 = L.idFromTag("LOGINIT"), .pa = loginit_pa, .size = LIBOS_LOG_SIZE, .kind = contig, .loc = sysmem_loc };
@@ -863,9 +863,9 @@ test "buildBootArgs: regions + message queue init args" {
     try testing.expectEqual(@as(usize, 4), ba.regions.len);
     try testing.expectEqual(proto.LibosMemoryRegionInitArgument.idFromTag("LOGINIT"), ba.regions[0].id8);
     try testing.expectEqual(@as(u64, LIBOS_LOG_SIZE), ba.regions[0].size);
-    try testing.expectEqual(@intFromEnum(proto.LibosMemoryRegionLoc.sysmem), ba.regions[0].loc);
+    try testing.expectEqual(@backingInt(proto.LibosMemoryRegionLoc.sysmem), ba.regions[0].loc);
     // RMARGS is RADIX3 + points at the radix3 root.
-    try testing.expectEqual(@intFromEnum(proto.LibosMemoryRegionKind.radix3), ba.regions[3].kind);
+    try testing.expectEqual(@backingInt(proto.LibosMemoryRegionKind.radix3), ba.regions[3].kind);
     try testing.expectEqual(radix3_root, ba.regions[3].pa);
 
     // Message-queue init args.

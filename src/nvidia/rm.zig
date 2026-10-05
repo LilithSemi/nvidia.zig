@@ -792,7 +792,7 @@ test "live: memToDmaBuf: system memory -> real dma-buf fd" {
     // A real dma-buf shows something like "anon_inode:dmabuf" or "/dmabuf:...".
     // A /dev/nvidiactl fd (the bug the prior attempt had) would show "/dev/nvidiactl".
     var proc_path_buf: [64]u8 = undefined;
-    const proc_path = std.fmt.bufPrintZ(&proc_path_buf, "/proc/self/fd/{d}", .{dmabuf_fd}) catch unreachable;
+    const proc_path = std.mem.printSentinel(&proc_path_buf, "/proc/self/fd/{d}", .{dmabuf_fd}, 0) catch unreachable;
     var link_target: [256]u8 = undefined;
     const link_len = std.os.linux.readlink(proc_path.ptr, &link_target, link_target.len);
     try std.testing.expect(@as(isize, @bitCast(link_len)) > 0);

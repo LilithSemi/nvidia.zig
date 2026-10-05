@@ -421,13 +421,13 @@ pub const Assembler = struct {
         const count = self.n / 4;
         if (count == 0) return;
 
-        var reg_ready = [_]u32{0} ** 256; // cycle a same-pipe reader can use a GPR
-        var reg_pipe = [_]Pipe{.other} ** 256; // the pipe that wrote it
-        var pred_ready = [_]u32{0} ** 8; // when an ALU can read a predicate
-        var pred_ready_guard = [_]u32{0} ** 8; // when a guard or branch can read it
-        var wr_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending write
-        var rd_bar = [_]u8{NO_BARRIER} ** 256; // scoreboard guarding a pending read
-        var bar_used = [_]bool{false} ** BARRIERS;
+        var reg_ready: [256]u32 = @splat(0); // cycle a same-pipe reader can use a GPR
+        var reg_pipe: [256]Pipe = @splat(.other); // the pipe that wrote it
+        var pred_ready: [8]u32 = @splat(0); // when an ALU can read a predicate
+        var pred_ready_guard: [8]u32 = @splat(0); // when a guard or branch can read it
+        var wr_bar: [256]u8 = @splat(NO_BARRIER); // scoreboard guarding a pending write
+        var rd_bar: [256]u8 = @splat(NO_BARRIER); // scoreboard guarding a pending read
+        var bar_used: [BARRIERS]bool = @splat(false);
 
         var cycle: u32 = 0;
         var prev_issue: u32 = 0;
@@ -906,7 +906,7 @@ pub const Assembler = struct {
         setBits(w, 72, 1, 0); // not the 64-bit extended form
         setBits(w, 73, 1, @intFromBool(signed));
         setBits(w, 74, 2, 0); // combine with the accumulator through AND
-        setBits(w, 76, 3, @intFromEnum(cmp));
+        setBits(w, 76, 3, @backingInt(cmp));
         setBits(w, 81, 3, dst);
         setBits(w, 84, 3, PT); // no second destination
         var dp = Dep.Builder{};
@@ -988,7 +988,7 @@ pub const Assembler = struct {
     fn putGlobalAccess(w: []u32, mem_type: MemType, offset: i32) void {
         std.debug.assert(offset >= -(1 << 23) and offset < (1 << 23));
         setBits(w, 40, 24, signedBits(offset, 24));
-        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 73, 3, @backingInt(mem_type));
         setBits(w, 77, 4, 0xa); // order STRONG, scope SYS
         setBits(w, 84, 3, 1); // eviction NORMAL
         setBits(w, 90, 1, 1); // the GPR address is a 64-bit register pair
@@ -1060,7 +1060,7 @@ pub const Assembler = struct {
         setBits(w, 24, 8, addr);
         setBits(w, 32, 8, URZ);
         setBits(w, 40, 24, signedBits(offset, 24));
-        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 73, 3, @backingInt(mem_type));
         setBits(w, 78, 2, 0); // address stride x1
         setBits(w, 87, 1, 0); // no predicate result
         setBits(w, 91, 1, 1);
@@ -1085,7 +1085,7 @@ pub const Assembler = struct {
         setBits(w, 32, 8, data);
         setBits(w, 64, 8, URZ);
         setBits(w, 40, 24, signedBits(offset, 24));
-        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 73, 3, @backingInt(mem_type));
         setBits(w, 78, 2, 0); // address stride x1
         setBits(w, 91, 1, 1);
         var dp = Dep.Builder{};
@@ -1110,7 +1110,7 @@ pub const Assembler = struct {
         setBits(w, 24, 8, index);
         setBits(w, 38, 16, cb.offset);
         setBits(w, 54, 5, cb.bank);
-        setBits(w, 73, 3, @intFromEnum(mem_type));
+        setBits(w, 73, 3, @backingInt(mem_type));
         setBits(w, 78, 2, 0); // indexed mode
         setBits(w, 80, 2, 0); // no texture-header unpack (sm >= 120)
         setBits(w, 91, 1, 0); // bound bank, not a bindless handle
@@ -1130,7 +1130,7 @@ pub const Assembler = struct {
         const w = self.next();
         setBits(w, 0, 12, 0x992);
         setBits(w, 72, 1, 0); // not MMIO
-        setBits(w, 76, 3, @intFromEnum(scope));
+        setBits(w, 76, 3, @backingInt(scope));
         setBits(w, 80, 1, 0); // not the strong-cached form
         var dp = Dep.Builder{};
         dp.dep.fence = true;

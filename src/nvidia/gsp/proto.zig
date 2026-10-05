@@ -521,8 +521,8 @@ comptime {
     std.debug.assert(@offsetOf(LibosMemoryRegionInitArgument, "kind") == 24);
     std.debug.assert(@offsetOf(LibosMemoryRegionInitArgument, "loc") == 25);
     std.debug.assert(@sizeOf(LibosMemoryRegionInitArgument) == 32);
-    std.debug.assert(@intFromEnum(LibosMemoryRegionKind.radix3) == 2);
-    std.debug.assert(@intFromEnum(LibosMemoryRegionLoc.sysmem) == 1);
+    std.debug.assert(@backingInt(LibosMemoryRegionKind.radix3) == 2);
+    std.debug.assert(@backingInt(LibosMemoryRegionLoc.sysmem) == 1);
 }
 
 test "GSP transport struct layouts match the NVIDIA 595.71.05 ABI" {
@@ -546,10 +546,10 @@ test "GSP transport struct layouts match the NVIDIA 595.71.05 ABI" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(MsgqRxHeader));
 
     // The enum function numbers carried on the wire.
-    try std.testing.expectEqual(@as(NvU32, 2), @intFromEnum(Function.alloc_root));
-    try std.testing.expectEqual(@as(NvU32, 10), @intFromEnum(Function.free));
-    try std.testing.expectEqual(@as(NvU32, 76), @intFromEnum(Function.gsp_rm_control));
-    try std.testing.expectEqual(@as(NvU32, 103), @intFromEnum(Function.gsp_rm_alloc));
-    try std.testing.expectEqual(@as(NvU32, 0x1001), @intFromEnum(Event.gsp_init_done));
-    try std.testing.expectEqual(@as(NvU32, 0x1004), @intFromEnum(Event.rc_triggered));
+    try std.testing.expectEqual(@as(NvU32, 2), @backingInt(Function.alloc_root));
+    try std.testing.expectEqual(@as(NvU32, 10), @backingInt(Function.free));
+    try std.testing.expectEqual(@as(NvU32, 76), @backingInt(Function.gsp_rm_control));
+    try std.testing.expectEqual(@as(NvU32, 103), @backingInt(Function.gsp_rm_alloc));
+    try std.testing.expectEqual(@as(NvU32, 0x1001), @backingInt(Event.gsp_init_done));
+    try std.testing.expectEqual(@as(NvU32, 0x1004), @backingInt(Event.rc_triggered));
 }

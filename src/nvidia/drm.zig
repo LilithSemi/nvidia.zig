@@ -141,7 +141,7 @@ pub fn openNvidiaDrmNode() DrmError!std.posix.fd_t {
 
             // Build the sysfs driver symlink path: /sys/class/drm/<name>/device/driver
             var sysfs_buf: [128]u8 = undefined;
-            const sysfs_path = std.fmt.bufPrintZ(&sysfs_buf, "/sys/class/drm/{s}/device/driver", .{name}) catch continue;
+            const sysfs_path = std.mem.printSentinel(&sysfs_buf, "/sys/class/drm/{s}/device/driver", .{name}, 0) catch continue;
 
             var link_buf: [256]u8 = undefined;
             const link_len = std.os.linux.readlink(sysfs_path.ptr, &link_buf, link_buf.len);
@@ -154,7 +154,7 @@ pub fn openNvidiaDrmNode() DrmError!std.posix.fd_t {
 
             // Found the nvidia-drm node -- open it.
             var dev_buf: [64]u8 = undefined;
-            const dev_path = std.fmt.bufPrintZ(&dev_buf, "/dev/dri/{s}", .{name}) catch continue;
+            const dev_path = std.mem.printSentinel(&dev_buf, "/dev/dri/{s}", .{name}, 0) catch continue;
             const rc = std.os.linux.open(dev_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
             switch (std.os.linux.errno(rc)) {
                 .SUCCESS => return @intCast(rc),

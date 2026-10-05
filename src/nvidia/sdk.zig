@@ -234,7 +234,7 @@ pub const GpuGetIdParams = extern struct {
 /// NV2080_CTRL_GPU_GET_NAME_STRING_PARAMS (ASCII variant).
 pub const GpuGetNameStringParams = extern struct {
     flags: NvU32 = 0, // 0 = ASCII
-    ascii: [GPU_NAME_MAX_LENGTH]u8 = [_]u8{0} ** GPU_NAME_MAX_LENGTH,
+    ascii: [GPU_NAME_MAX_LENGTH]u8 = @splat(0),
 };
 
 /// NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2 (ctrl0000system.h): the V2 form of
@@ -245,14 +245,14 @@ pub const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2: NvU32 = 0x12b;
 
 /// NV0000_CTRL_SYSTEM_GET_P2P_CAPS_V2_PARAMS (ctrl0000system.h).
 pub const P2pCapsV2Params = extern struct {
-    gpu_ids: [MAX_ATTACHED_GPUS]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS,
+    gpu_ids: [MAX_ATTACHED_GPUS]NvU32 = @splat(0),
     gpu_count: NvU32 = 0,
     p2p_caps: NvU32 = 0,
     p2p_optimal_read_ces: NvU32 = 0,
     p2p_optimal_write_ces: NvU32 = 0,
-    p2p_caps_status: [CAPS_STATUS_TABLE_SIZE]NvU8 = [_]NvU8{0} ** CAPS_STATUS_TABLE_SIZE,
-    bus_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS_SQUARED,
-    bus_egm_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = [_]NvU32{0} ** MAX_ATTACHED_GPUS_SQUARED,
+    p2p_caps_status: [CAPS_STATUS_TABLE_SIZE]NvU8 = @splat(0),
+    bus_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = @splat(0),
+    bus_egm_peer_ids: [MAX_ATTACHED_GPUS_SQUARED]NvU32 = @splat(0),
 
     pub const MAX_ATTACHED_GPUS = 32; // NV0000_CTRL_SYSTEM_MAX_ATTACHED_GPUS
     pub const MAX_ATTACHED_GPUS_SQUARED = 1024; // NV0000_CTRL_SYSTEM_MAX_ATTACHED_GPUS_SQUARED
@@ -377,8 +377,8 @@ pub const ChannelAllocParams = extern struct {
     flags: NvU32 = 0,
     h_context_share: NvHandle = 0,
     h_vaspace: NvHandle = 0,
-    h_userd_memory: [NV_MAX_SUBDEVICES]NvHandle = [_]NvHandle{0} ** NV_MAX_SUBDEVICES,
-    userd_offset: [NV_MAX_SUBDEVICES]NvU64 align(8) = [_]NvU64{0} ** NV_MAX_SUBDEVICES,
+    h_userd_memory: [NV_MAX_SUBDEVICES]NvHandle = @splat(0),
+    userd_offset: [NV_MAX_SUBDEVICES]NvU64 align(8) = @splat(0),
     engine_type: NvU32 = 0,
     cid: NvU32 = 0,
     sub_device_id: NvU32 = 0,
@@ -393,9 +393,9 @@ pub const ChannelAllocParams = extern struct {
     ecc_error_notifier_mem: MemoryDescParams align(8) = .{},
     process_id: NvU32 = 0,
     sub_process_id: NvU32 = 0,
-    encrypt_iv: [3]NvU32 = [_]NvU32{0} ** 3,
-    decrypt_iv: [3]NvU32 = [_]NvU32{0} ** 3,
-    hmac_nonce: [8]NvU32 = [_]NvU32{0} ** 8,
+    encrypt_iv: [3]NvU32 = @splat(0),
+    decrypt_iv: [3]NvU32 = @splat(0),
+    hmac_nonce: [8]NvU32 = @splat(0),
     tpc_config_id: NvU32 = 0,
 };
 

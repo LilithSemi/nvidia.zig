@@ -331,7 +331,7 @@ fn bindZetaFmt(s: *threed.Stream, zt_va: u64, w: u32, h: u32, format: u32, bpp: 
 /// (mapped to [0,1] by the viewport) is compared against the stored depth.
 pub fn setDepthTest(s: *threed.Stream, func: DepthFunc, write_enable: bool) void {
     s.m1(SET_DEPTH_TEST, 1);
-    s.m1(SET_DEPTH_FUNC, @intFromEnum(func));
+    s.m1(SET_DEPTH_FUNC, @backingInt(func));
     s.m1(SET_DEPTH_WRITE, if (write_enable) 1 else 0);
 }
 
@@ -492,7 +492,7 @@ pub fn setDepthReplace(s: *threed.Stream, replace: bool) void {
 /// func) faults. nvk always emits the full depth state with the ZETA, so we do too.
 pub fn setDepthDisabled(s: *threed.Stream) void {
     s.m1(SET_DEPTH_TEST, 0);
-    s.m1(SET_DEPTH_FUNC, @intFromEnum(DepthFunc.always));
+    s.m1(SET_DEPTH_FUNC, @backingInt(DepthFunc.always));
     s.m1(SET_DEPTH_WRITE, 0);
 }
 
@@ -515,10 +515,10 @@ pub fn setStencilTest(s: *threed.Stream, func: DepthFunc, fail: StencilOp, zfail
     // The HAL StencilState is single-face, so disable two-sided and let the FRONT methods
     // below govern both windings.
     s.m1(SET_TWO_SIDED_STENCIL_TEST, 0);
-    s.m1(SET_STENCIL_OP_FAIL, @intFromEnum(fail));
-    s.m1(SET_STENCIL_OP_ZFAIL, @intFromEnum(zfail));
-    s.m1(SET_STENCIL_OP_ZPASS, @intFromEnum(zpass));
-    s.m1(SET_STENCIL_FUNC, @intFromEnum(func));
+    s.m1(SET_STENCIL_OP_FAIL, @backingInt(fail));
+    s.m1(SET_STENCIL_OP_ZFAIL, @backingInt(zfail));
+    s.m1(SET_STENCIL_OP_ZPASS, @backingInt(zpass));
+    s.m1(SET_STENCIL_FUNC, @backingInt(func));
     s.m1(SET_STENCIL_FUNC_REF, ref);
     s.m1(SET_STENCIL_FUNC_MASK, compare_mask);
     s.m1(SET_STENCIL_MASK, write_mask);
@@ -547,18 +547,18 @@ pub fn setStencilTestTwoSided(
     s.m1(SET_STENCIL_TEST, 1);
     s.m1(SET_TWO_SIDED_STENCIL_TEST, 1);
     // FRONT face.
-    s.m1(SET_STENCIL_OP_FAIL, @intFromEnum(f_fail));
-    s.m1(SET_STENCIL_OP_ZFAIL, @intFromEnum(f_zfail));
-    s.m1(SET_STENCIL_OP_ZPASS, @intFromEnum(f_zpass));
-    s.m1(SET_STENCIL_FUNC, @intFromEnum(f_func));
+    s.m1(SET_STENCIL_OP_FAIL, @backingInt(f_fail));
+    s.m1(SET_STENCIL_OP_ZFAIL, @backingInt(f_zfail));
+    s.m1(SET_STENCIL_OP_ZPASS, @backingInt(f_zpass));
+    s.m1(SET_STENCIL_FUNC, @backingInt(f_func));
     s.m1(SET_STENCIL_FUNC_REF, f_ref);
     s.m1(SET_STENCIL_FUNC_MASK, f_cmask);
     s.m1(SET_STENCIL_MASK, f_wmask);
     // BACK face.
-    s.m1(SET_BACK_STENCIL_OP_FAIL, @intFromEnum(b_fail));
-    s.m1(SET_BACK_STENCIL_OP_ZFAIL, @intFromEnum(b_zfail));
-    s.m1(SET_BACK_STENCIL_OP_ZPASS, @intFromEnum(b_zpass));
-    s.m1(SET_BACK_STENCIL_FUNC, @intFromEnum(b_func));
+    s.m1(SET_BACK_STENCIL_OP_FAIL, @backingInt(b_fail));
+    s.m1(SET_BACK_STENCIL_OP_ZFAIL, @backingInt(b_zfail));
+    s.m1(SET_BACK_STENCIL_OP_ZPASS, @backingInt(b_zpass));
+    s.m1(SET_BACK_STENCIL_FUNC, @backingInt(b_func));
     s.m1(SET_BACK_STENCIL_FUNC_REF, b_ref);
     s.m1(SET_BACK_STENCIL_FUNC_MASK, b_cmask);
     s.m1(SET_BACK_STENCIL_MASK, b_wmask);
@@ -720,7 +720,7 @@ test "blGobByteOffset matches Mesa CopyGOBTuring2D byte-for-byte (Blackwell colo
         .{ .toff = 0xc0, .xadd = 16, .row = 4 }, .{ .toff = 0xd0, .xadd = 16, .row = 5 },
         .{ .toff = 0xe0, .xadd = 16, .row = 6 }, .{ .toff = 0xf0, .xadd = 16, .row = 7 },
     };
-    var ref = [_]u32{0xffff} ** (64 * 8); // [row*64 + xbyte] -> tiled offset
+    var ref: [64 * 8]u32 = @splat(0xffff); // [row*64 + xbyte] -> tiled offset
     var i: u32 = 0;
     while (i < 2) : (i += 1) {
         for (lines) |ln| {
@@ -961,7 +961,7 @@ fn descSet(d: *[8]u32, lo: usize, width: usize, val: u32) void {
 /// SELECT_BLOCKLINEAR_V2, COMPONENTS = A8B8G8R8, DATA_TYPE = UNORM, X/Y/Z/W_SOURCE =
 /// R/G/B/A, the block tiling, WIDTH/HEIGHT/DEPTH minus one, NORMALIZED_COORDS).
 pub fn fillTic(tex_va: u64, w: u32, h: u32, fmt: TicFormat, max_mip_level: u32) [8]u32 {
-    var d = [_]u32{0} ** 8;
+    var d: [8]u32 = @splat(0);
     // MAX_MIP_LEVEL (V2_BL MW 95:92) = the highest mip index the HW may sample (levels-1). 0 keeps
     // the single-level behavior. The block tiling below is level 0's; the HW derives each lower
     // level's offset + clamped block height itself (matching blMipLevelOffset / nvk nil).
@@ -1107,7 +1107,7 @@ pub fn texPitchBytes(w: u32) u32 {
 /// A pitch-linear texture is the natural layout for a small sampled image: the CPU
 /// writes it row-major exactly as the sampler reads it (no tiling to get wrong).
 pub fn fillTicPitch(tex_va: u64, w: u32, h: u32, pitch_bytes: u32) [8]u32 {
-    var d = [_]u32{0} ** 8;
+    var d: [8]u32 = @splat(0);
     descSet(&d, 112, 7, 0x08); // COMPONENTS = A8B8G8R8
     descSet(&d, 108, 4, 0); // DATA_TYPE = UNORM
     descSet(&d, 96, 3, 2); // X_SOURCE = IN_R
@@ -1172,7 +1172,7 @@ test "anisoLevel maps the ratio to the TSC 3-bit level" {
 }
 
 pub fn fillTsc(filter: TexFilter, address_u: TexAddress, address_v: TexAddress, mip_filter: TexMipFilter, max_anisotropy: f32) [8]u32 {
-    var d = [_]u32{0} ** 8;
+    var d: [8]u32 = @splat(0);
     descSet(&d, 20, 3, anisoLevel(max_anisotropy)); // TEXSAMP0 MAX_ANISOTROPY (22:20)
     // TEXSAMP0 (word 0): ADDRESS_U (2:0), ADDRESS_V (5:3), ADDRESS_P (8:6).
     descSet(&d, 0, 3, tscAddr(address_u));
@@ -1404,7 +1404,7 @@ pub const Sph = struct {
     // imap and the VTG generic omap live above dword 17, so the full 32-dword
     // header must be uploaded (older code used 20 dwords, which was enough for a
     // position-only passthrough but truncates the generic varying maps).
-    data: [32]u32 = [_]u32{0} ** 32, // 128 bytes, SPHV4
+    data: [32]u32 = @splat(0), // 128 bytes, SPHV4
 
     fn set(self: *Sph, lo: usize, width: usize, val: u64) void {
         var i: usize = 0;
@@ -1421,7 +1421,7 @@ pub const Sph = struct {
         var s = Sph{};
         s.set(0, 5, 0x01); // SPH_TYPE = TYPE_01_VTG
         s.set(5, 5, 4); // VERSION = 4 (sm>=73)
-        s.set(10, 4, @intFromEnum(ShaderType.vertex)); // SHADER_TYPE
+        s.set(10, 4, @backingInt(ShaderType.vertex)); // SHADER_TYPE
         s.set(17, 4, 1); // SASS_VERSION (NAK sets this to 1 on every shader)
         return s;
     }
@@ -1431,7 +1431,7 @@ pub const Sph = struct {
         var s = Sph{};
         s.set(0, 5, 0x02); // SPH_TYPE = TYPE_02_PS
         s.set(5, 5, 4); // VERSION = 4
-        s.set(10, 4, @intFromEnum(ShaderType.pixel)); // SHADER_TYPE = PIXEL
+        s.set(10, 4, @backingInt(ShaderType.pixel)); // SHADER_TYPE = PIXEL
         s.set(17, 4, 1); // SASS_VERSION
         s.set(14, 1, 1); // MRT_ENABLE (NAK always sets this true for fragment)
         // REQUIRED on every fragment shader: imap_system_values_ab bit 31 (absolute
@@ -1612,7 +1612,7 @@ pub const ROOT_TABLE_GRAPHICS: u32 = 1;
 /// null TIC descriptor). 64 dwords = the full 256-byte root table.
 pub fn zeroConstantBuffer0(s: *threed.Stream) void {
     s.ni(0x0504, &.{ROOT_TABLE_GRAPHICS}); // SET_ROOT_TABLE_SELECTOR table=ROOT_TABLE_GRAPHICS offset=0
-    const zeros = [_]u32{0} ** 64;
+    const zeros: [64]u32 = @splat(0);
     s.ni(0x0508, &zeros); // LOAD_ROOT_TABLE: 64 dwords
 }
 
@@ -1723,7 +1723,7 @@ pub fn initStaticState(s: *threed.Stream, tls_va: u64, cb0_va: u64) void {
         var t: u32 = 0;
         while (t < 8) : (t += 1) {
             s.ni(0x0504, &.{t & 0x7}); // SET_ROOT_TABLE_SELECTOR
-            const zeros = [_]u32{0} ** 64;
+            const zeros: [64]u32 = @splat(0);
             s.ni(0x0508, &zeros); // LOAD_ROOT_TABLE x64
         }
     }
@@ -1970,12 +1970,12 @@ pub fn setBlend(s: *threed.Stream, b: BlendState) void {
     s.m1(0x1328, f2u(b.constant[3])); // SET_BLEND_CONST_ALPHA
     // Per-target (target 0) blend state: methods 0x1e00 + 0*32.
     s.m1(0x1e00, 1); // SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA(0) = TRUE
-    s.m1(0x1e04, @intFromEnum(b.color_op)); // SET_BLEND_PER_TARGET_COLOR_OP(0)
-    s.m1(0x1e08, @intFromEnum(b.src_color)); // SET_BLEND_PER_TARGET_COLOR_SOURCE_COEFF(0)
-    s.m1(0x1e0c, @intFromEnum(b.dst_color)); // SET_BLEND_PER_TARGET_COLOR_DEST_COEFF(0)
-    s.m1(0x1e10, @intFromEnum(b.alpha_op)); // SET_BLEND_PER_TARGET_ALPHA_OP(0)
-    s.m1(0x1e14, @intFromEnum(b.src_alpha)); // SET_BLEND_PER_TARGET_ALPHA_SOURCE_COEFF(0)
-    s.m1(0x1e18, @intFromEnum(b.dst_alpha)); // SET_BLEND_PER_TARGET_ALPHA_DEST_COEFF(0)
+    s.m1(0x1e04, @backingInt(b.color_op)); // SET_BLEND_PER_TARGET_COLOR_OP(0)
+    s.m1(0x1e08, @backingInt(b.src_color)); // SET_BLEND_PER_TARGET_COLOR_SOURCE_COEFF(0)
+    s.m1(0x1e0c, @backingInt(b.dst_color)); // SET_BLEND_PER_TARGET_COLOR_DEST_COEFF(0)
+    s.m1(0x1e10, @backingInt(b.alpha_op)); // SET_BLEND_PER_TARGET_ALPHA_OP(0)
+    s.m1(0x1e14, @backingInt(b.src_alpha)); // SET_BLEND_PER_TARGET_ALPHA_SOURCE_COEFF(0)
+    s.m1(0x1e18, @backingInt(b.dst_alpha)); // SET_BLEND_PER_TARGET_ALPHA_DEST_COEFF(0)
     s.m1(0x1360, 1); // SET_BLEND(0) = TRUE
 }
 
@@ -2020,7 +2020,7 @@ pub const DRAW_CONTROL_A_INSTANCE_ITERATE_ENABLE = 1 << 9;
 /// INSTANCE_ITERATE_ENABLE, and its second field (DRAW_CONTROL_B = 0x0264) is the instance
 /// count; then DRAW_VERTEX_ARRAY_BEGIN_END_A (0x0270) supplies start + count.
 pub fn drawInstanced(s: *threed.Stream, topology: Topology, first: u32, count: u32, instance_count: u32) void {
-    const t = @intFromEnum(topology);
+    const t = @backingInt(topology);
     const draw_control_a = t | DRAW_CONTROL_A_INSTANCE_ITERATE_ENABLE;
     s.m1(0x1970, topology.primTopoV()); // SET_PRIMITIVE_TOPOLOGY (its own encoding, 1/2/4)
     s.mm(0x0260, &.{ draw_control_a, @max(instance_count, 1) }); // SET_DRAW_CONTROL_A, DRAW_CONTROL_B (instance_count)

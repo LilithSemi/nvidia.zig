@@ -104,7 +104,7 @@ pub const Transport = struct {
     /// Per-object record so mapMemory can return a CPU slice without an mmap and
     /// mapToGpu / control can resolve a handle to its phys. A small fixed table
     /// (baremetal has no heap; the HAL allocates a handful of objects).
-    objects: [MAX_OBJECTS]ObjectRecord = [_]ObjectRecord{.{}} ** MAX_OBJECTS,
+    objects: [MAX_OBJECTS]ObjectRecord = @splat(.{}),
     object_count: usize = 0,
 
     /// Scratch for marshalling one outbound RPC element (header + body + params).
@@ -199,12 +199,12 @@ pub const Transport = struct {
     /// GET_GSP_STATIC_INFO, SET_REGISTRY. Sent as bare RPCs through the live ring.
     /// HARDWARE-ONLY to complete (needs the GSP answering); the assembly compiles.
     fn postInit(self: *Transport) Error!void {
-        try self.sendRpc(@intFromEnum(proto.Function.gsp_set_system_info), &[_]u8{});
-        _ = try self.recvRpc(@intFromEnum(proto.Function.gsp_set_system_info));
-        try self.sendRpc(@intFromEnum(proto.Function.set_registry), &[_]u8{});
-        _ = try self.recvRpc(@intFromEnum(proto.Function.set_registry));
-        try self.sendRpc(@intFromEnum(proto.Function.get_gsp_static_info), &[_]u8{});
-        _ = try self.recvRpc(@intFromEnum(proto.Function.get_gsp_static_info));
+        try self.sendRpc(@backingInt(proto.Function.gsp_set_system_info), &[_]u8{});
+        _ = try self.recvRpc(@backingInt(proto.Function.gsp_set_system_info));
+        try self.sendRpc(@backingInt(proto.Function.set_registry), &[_]u8{});
+        _ = try self.recvRpc(@backingInt(proto.Function.set_registry));
+        try self.sendRpc(@backingInt(proto.Function.get_gsp_static_info), &[_]u8{});
+        _ = try self.recvRpc(@backingInt(proto.Function.get_gsp_static_info));
     }
 
     pub fn deinit(self: Transport) void {
@@ -227,7 +227,7 @@ pub const Transport = struct {
         var p = sdk.RmApiVersion{
             .cmd = cmd,
             .reply = sdk.RmApiVersion.REPLY_UNRECOGNIZED,
-            .version_string = [_]u8{0} ** sdk.RmApiVersion.STRING_LENGTH,
+            .version_string = @splat(0),
         };
         // Fill in the pinned firmware version (the GSP firmware we boot against).
         const fwv = fw.FW_VERSION;
@@ -328,7 +328,7 @@ pub const Transport = struct {
 
         // The GSP echoes GSP_RM_ALLOC with the out status + the assigned handle and
         // any written-back params. Read the alloc header back from the reply.
-        const reply = try self.recvRpc(@intFromEnum(proto.Function.gsp_rm_alloc));
+        const reply = try self.recvRpc(@backingInt(proto.Function.gsp_rm_alloc));
         const a: *const proto.RpcGspRmAlloc = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
         if (a.status != 0) return error.RmAllocFailed;
 
@@ -349,8 +349,8 @@ pub const Transport = struct {
     pub fn rmFree(self: *Transport, h_root: sdk.NvHandle, h_parent: sdk.NvHandle, h_object: sdk.NvHandle) void {
         if (!self.booted) return;
         var p = sdk.Os00Params{ .h_root = h_root, .h_object_parent = h_parent, .h_object_old = h_object, .status = 0 };
-        self.sendRpc(@intFromEnum(proto.Function.free), std.mem.asBytes(&p)) catch return;
-        _ = self.recvRpc(@intFromEnum(proto.Function.free)) catch return;
+        self.sendRpc(@backingInt(proto.Function.free), std.mem.asBytes(&p)) catch return;
+        _ = self.recvRpc(@backingInt(proto.Function.free)) catch return;
         self.untrack(h_object);
     }
 
@@ -451,8 +451,8 @@ pub const Transport = struct {
             .status = 0,
             .flags = 0,
         };
-        try self.sendRpc(@intFromEnum(proto.Function.map_memory), std.mem.asBytes(&p));
-        _ = try self.recvRpc(@intFromEnum(proto.Function.map_memory));
+        try self.sendRpc(@backingInt(proto.Function.map_memory), std.mem.asBytes(&p));
+        _ = try self.recvRpc(@backingInt(proto.Function.map_memory));
 
         // Resolve the object's CPU window (the identity-mapped phys WE assigned it).
         const rec = self.lookup(mem.handle) orelse return error.MapFailed;
@@ -489,7 +489,7 @@ pub const Transport = struct {
         );
         self.endpoint.send(self.rpc_scratch[0..n]) catch return error.IoctlFailed;
 
-        const reply = try self.recvRpc(@intFromEnum(proto.Function.gsp_rm_control));
+        const reply = try self.recvRpc(@backingInt(proto.Function.gsp_rm_control));
         const c: *const proto.RpcGspRmControl = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
         if (c.status != 0) return error.ControlFailed;
 
@@ -536,8 +536,8 @@ pub const Transport = struct {
             .dma_offset = gpu_va,
             .status = 0,
         };
-        try self.sendRpc(@intFromEnum(proto.Function.map_memory_dma), std.mem.asBytes(&p));
-        const reply = try self.recvRpc(@intFromEnum(proto.Function.map_memory_dma));
+        try self.sendRpc(@backingInt(proto.Function.map_memory_dma), std.mem.asBytes(&p));
+        const reply = try self.recvRpc(@backingInt(proto.Function.map_memory_dma));
         // The GSP writes the actual dma_offset + status back into the NVOS46 body.
         const out: *const sdk.Os46Params = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
         if (out.status != 0) return error.MapFailed;
@@ -670,7 +670,7 @@ const FakeRing = struct {
     /// handle path is exercised). Returns the drained alloc's class + parent.
     fn replyAlloc(self: *FakeRing, assigned_handle: u32) !Drained {
         const got = try self.gsp.recv();
-        try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_alloc), got.function);
+        try testing.expectEqual(@backingInt(proto.Function.gsp_rm_alloc), got.function);
         const a: *const proto.RpcGspRmAlloc = @ptrCast(@alignCast(&got.rpc[@sizeOf(proto.RpcMessageHeader)]));
         var d = Drained{ .function = got.function, .h_class = a.h_class, .h_parent = a.h_parent };
         const psize = a.params_size;
@@ -690,7 +690,7 @@ const FakeRing = struct {
     /// Drain + reply to one CONTROL (status 0, params echoed). Returns the cmd.
     fn replyControl(self: *FakeRing) !Drained {
         const got = try self.gsp.recv();
-        try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_control), got.function);
+        try testing.expectEqual(@backingInt(proto.Function.gsp_rm_control), got.function);
         const c: *const proto.RpcGspRmControl = @ptrCast(@alignCast(&got.rpc[@sizeOf(proto.RpcMessageHeader)]));
         var d = Drained{ .function = got.function, .cmd = c.cmd };
         const psize = c.params_size;
@@ -753,12 +753,12 @@ test "freestanding rmAlloc: marshals GSP_RM_ALLOC + returns the assigned handle"
     const rpc: *const proto.RpcMessageHeader = @ptrCast(@alignCast(&t.rpc_scratch[0]));
     try testing.expectEqual(proto.RpcMessageHeader.HEADER_VERSION, rpc.header_version);
     try testing.expectEqual(proto.RpcMessageHeader.SIGNATURE, rpc.signature);
-    try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_alloc), rpc.function);
+    try testing.expectEqual(@backingInt(proto.Function.gsp_rm_alloc), rpc.function);
 
     const drained = try fr.replyAlloc(0xABCD);
     try testing.expectEqual(@as(u32, sdk.NV01_ROOT), drained.h_class);
 
-    const reply = try t.recvRpc(@intFromEnum(proto.Function.gsp_rm_alloc));
+    const reply = try t.recvRpc(@backingInt(proto.Function.gsp_rm_alloc));
     const a: *const proto.RpcGspRmAlloc = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
     try testing.expectEqual(@as(u32, 0), a.status);
     try testing.expectEqual(@as(sdk.NvHandle, 0xABCD), a.h_object);
@@ -783,7 +783,7 @@ test "freestanding allocDevice: ROOT -> DEVICE -> SUBDEVICE RPC sequence" {
     const root = try fr.replyAlloc(0x5000);
     try testing.expectEqual(@as(u32, sdk.NV01_ROOT), root.h_class);
     try testing.expectEqual(@as(u32, 0), root.h_parent);
-    _ = try t.recvRpc(@intFromEnum(proto.Function.gsp_rm_alloc));
+    _ = try t.recvRpc(@backingInt(proto.Function.gsp_rm_alloc));
 
     // 2. DEVICE (parent == root 0x5000, class NV01_DEVICE_0, NV0080 params).
     var dp = sdk.Nv0080AllocParameters{ .device_id = 0, .h_client_share = sdk.NV01_NULL_OBJECT, .h_target_client = 0, .h_target_device = 0, .flags = 0, .va_space_size = 0, .va_start_internal = 0, .va_limit_internal = 0, .va_mode = 0 };
@@ -793,7 +793,7 @@ test "freestanding allocDevice: ROOT -> DEVICE -> SUBDEVICE RPC sequence" {
     try testing.expectEqual(@as(u32, sdk.NV01_DEVICE_0), device.h_class);
     try testing.expectEqual(@as(u32, 0x5000), device.h_parent);
     try testing.expectEqual(@as(usize, @sizeOf(sdk.Nv0080AllocParameters)), device.params_len);
-    _ = try t.recvRpc(@intFromEnum(proto.Function.gsp_rm_alloc));
+    _ = try t.recvRpc(@backingInt(proto.Function.gsp_rm_alloc));
 
     // 3. SUBDEVICE (parent == device 0x6000, class NV20_SUBDEVICE_0, NV2080 params).
     var sp = sdk.Nv2080AllocParameters{ .sub_device_id = 0 };
@@ -819,7 +819,7 @@ test "freestanding control: marshals GSP_RM_CONTROL with the cmd + params" {
     try testing.expectEqual(sdk.NV2080_CTRL_CMD_GPU_GET_ID, drained.cmd);
     try testing.expectEqual(@as(usize, @sizeOf(sdk.GpuGetIdParams)), drained.params_len);
 
-    const reply = try t.recvRpc(@intFromEnum(proto.Function.gsp_rm_control));
+    const reply = try t.recvRpc(@backingInt(proto.Function.gsp_rm_control));
     const c: *const proto.RpcGspRmControl = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
     try testing.expectEqual(@as(u32, 0), c.status);
     try testing.expectEqual(sdk.NV2080_CTRL_CMD_GPU_GET_ID, c.cmd);
@@ -841,7 +841,7 @@ test "freestanding mapToGpu: NV01_MEMORY_VIRTUAL alloc then MAP_MEMORY_DMA" {
     try t.endpoint.send(t.rpc_scratch[0..n]);
     const vobj = try fr.replyAlloc(0x9000);
     try testing.expectEqual(sdk.NV01_MEMORY_VIRTUAL, vobj.h_class);
-    _ = try t.recvRpc(@intFromEnum(proto.Function.gsp_rm_alloc));
+    _ = try t.recvRpc(@backingInt(proto.Function.gsp_rm_alloc));
 
     // 2. the MAP_MEMORY_DMA RPC (NVOS46, DMA_OFFSET_FIXED).
     var dma = sdk.Os46Params{
@@ -857,21 +857,21 @@ test "freestanding mapToGpu: NV01_MEMORY_VIRTUAL alloc then MAP_MEMORY_DMA" {
         .dma_offset = gpu_va,
         .status = 0,
     };
-    try t.sendRpc(@intFromEnum(proto.Function.map_memory_dma), std.mem.asBytes(&dma));
+    try t.sendRpc(@backingInt(proto.Function.map_memory_dma), std.mem.asBytes(&dma));
     // GSP drains the DMA RPC + echoes it (status 0, dma_offset == gpu_va).
     const got = try fr.gsp.recv();
-    try testing.expectEqual(@intFromEnum(proto.Function.map_memory_dma), got.function);
+    try testing.expectEqual(@backingInt(proto.Function.map_memory_dma), got.function);
     const in: *const sdk.Os46Params = @ptrCast(@alignCast(&got.rpc[@sizeOf(proto.RpcMessageHeader)]));
     try testing.expectEqual(gpu_va, in.dma_offset);
     try testing.expect((in.flags & sdk.dma_flags.DMA_OFFSET_FIXED) != 0);
 
     var out: [256]u8 = undefined;
     const hdr: *proto.RpcMessageHeader = @ptrCast(@alignCast(&out[0]));
-    hdr.* = .{ .header_version = proto.RpcMessageHeader.HEADER_VERSION, .signature = proto.RpcMessageHeader.SIGNATURE, .length = @sizeOf(proto.RpcMessageHeader) + @sizeOf(sdk.Os46Params), .function = @intFromEnum(proto.Function.map_memory_dma), .rpc_result = 0, .rpc_result_private = 0, .sequence = 0, .u = 0 };
+    hdr.* = .{ .header_version = proto.RpcMessageHeader.HEADER_VERSION, .signature = proto.RpcMessageHeader.SIGNATURE, .length = @sizeOf(proto.RpcMessageHeader) + @sizeOf(sdk.Os46Params), .function = @backingInt(proto.Function.map_memory_dma), .rpc_result = 0, .rpc_result_private = 0, .sequence = 0, .u = 0 };
     @memcpy(out[@sizeOf(proto.RpcMessageHeader)..][0..@sizeOf(sdk.Os46Params)], std.mem.asBytes(&dma));
     try fr.gsp.send(out[0 .. @sizeOf(proto.RpcMessageHeader) + @sizeOf(sdk.Os46Params)]);
 
-    const reply = try t.recvRpc(@intFromEnum(proto.Function.map_memory_dma));
+    const reply = try t.recvRpc(@backingInt(proto.Function.map_memory_dma));
     const ro: *const sdk.Os46Params = @ptrCast(@alignCast(&reply[@sizeOf(proto.RpcMessageHeader)]));
     try testing.expectEqual(gpu_va, ro.dma_offset);
     try testing.expectEqual(@as(u32, 0), ro.status);
@@ -893,10 +893,10 @@ test "freestanding mapMemory: MAP_MEMORY RPC + a tracked CPU window" {
 
     // mapMemory sends MAP_MEMORY then recvs; interleave the fake GSP reply.
     var p = sdk.Os33Params{ .h_client = dev.client, .h_device = dev.subdevice, .h_memory = handle, .offset = 0, .length = size, .p_linear_address = 0, .status = 0, .flags = 0 };
-    try t.sendRpc(@intFromEnum(proto.Function.map_memory), std.mem.asBytes(&p));
+    try t.sendRpc(@backingInt(proto.Function.map_memory), std.mem.asBytes(&p));
     const fn_id = try fr.replyBare();
-    try testing.expectEqual(@intFromEnum(proto.Function.map_memory), fn_id);
-    _ = try t.recvRpc(@intFromEnum(proto.Function.map_memory));
+    try testing.expectEqual(@backingInt(proto.Function.map_memory), fn_id);
+    _ = try t.recvRpc(@backingInt(proto.Function.map_memory));
 
     // The CPU window is the identity-mapped phys WE assigned.
     const rec = t.lookup(handle).?;
@@ -915,10 +915,10 @@ test "freestanding rmFree: emits a FREE RPC + untracks the object" {
 
     // rmFree sends FREE then recvs; interleave the reply, then it untracks.
     var p = sdk.Os00Params{ .h_root = 0x5000, .h_object_parent = 0x6000, .h_object_old = handle, .status = 0 };
-    try t.sendRpc(@intFromEnum(proto.Function.free), std.mem.asBytes(&p));
+    try t.sendRpc(@backingInt(proto.Function.free), std.mem.asBytes(&p));
     const fn_id = try fr.replyBare();
-    try testing.expectEqual(@intFromEnum(proto.Function.free), fn_id);
-    _ = try t.recvRpc(@intFromEnum(proto.Function.free));
+    try testing.expectEqual(@backingInt(proto.Function.free), fn_id);
+    _ = try t.recvRpc(@backingInt(proto.Function.free));
     t.untrack(handle);
     try testing.expectEqual(@as(usize, 0), t.object_count);
 }

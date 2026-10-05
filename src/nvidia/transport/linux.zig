@@ -156,7 +156,7 @@ pub const Transport = struct {
 
     /// NV_ESC_CARD_INFO: enumerate the GPUs the driver knows about.
     fn cardInfo(self: *Transport) Error![sdk.NV_MAX_DEVICES]sdk.CardInfo {
-        var cards = [_]sdk.CardInfo{std.mem.zeroes(sdk.CardInfo)} ** sdk.NV_MAX_DEVICES;
+        var cards: [sdk.NV_MAX_DEVICES]sdk.CardInfo = @splat(std.mem.zeroes(sdk.CardInfo));
         const req = std.os.linux.IOCTL.IOWR(ioctl.NV_IOCTL_MAGIC, @intCast(ioctl.NV_ESC_CARD_INFO), [sdk.NV_MAX_DEVICES]sdk.CardInfo);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&cards));
         switch (std.os.linux.errno(rc)) {
@@ -192,7 +192,7 @@ pub const Transport = struct {
     /// Required before NV01_DEVICE_0 alloc is permitted (else INSUFFICIENT_PERMISSIONS).
     fn openGpuNode(self: *Transport, minor: sdk.NvU32) Error!std.posix.fd_t {
         var buf: [32]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&buf, "/dev/nvidia{d}", .{minor}) catch return error.OpenFailed;
+        const path = std.mem.printSentinel(&buf, "/dev/nvidia{d}", .{minor}, 0) catch return error.OpenFailed;
         const rc = std.os.linux.open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
@@ -403,7 +403,7 @@ fn checkVersionFd(fd: std.posix.fd_t, cmd: sdk.NvU32, ver: []const u8) Error!sdk
     var p = sdk.RmApiVersion{
         .cmd = cmd,
         .reply = 0,
-        .version_string = [_]u8{0} ** sdk.RmApiVersion.STRING_LENGTH,
+        .version_string = @splat(0),
     };
     const n = @min(ver.len, sdk.RmApiVersion.STRING_LENGTH - 1);
     @memcpy(p.version_string[0..n], ver[0..n]);

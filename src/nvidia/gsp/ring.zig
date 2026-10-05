@@ -262,8 +262,8 @@ pub const Endpoint = struct {
 
         const elem: *proto.GspMsgQueueElement = @ptrCast(@alignCast(&scratch[0]));
         // auth_tag_buffer / aad_buffer stay zero (CC OFF, plaintext path).
-        elem.auth_tag_buffer = [_]u8{0} ** 16;
-        elem.aad_buffer = [_]u8{0} ** 16;
+        elem.auth_tag_buffer = @splat(0);
+        elem.aad_buffer = @splat(0);
         elem.seq_num = self.tx_seq;
         elem.elem_count = elem_count;
         elem.check_sum = 0; // included in the checksum, so zero before computing
@@ -386,7 +386,7 @@ pub fn buildAllocElement(
     const total = @sizeOf(proto.RpcMessageHeader) + body_len;
     std.debug.assert(out.len >= total);
 
-    writeRpcHeader(out, @intFromEnum(proto.Function.gsp_rm_alloc), body_len);
+    writeRpcHeader(out, @backingInt(proto.Function.gsp_rm_alloc), body_len);
 
     const a: *proto.RpcGspRmAlloc = @ptrCast(@alignCast(&out[@sizeOf(proto.RpcMessageHeader)]));
     a.* = .{
@@ -397,7 +397,7 @@ pub fn buildAllocElement(
         .status = 0,
         .params_size = @intCast(params.len),
         .flags = flags,
-        .reserved = [_]u8{0} ** 4,
+        .reserved = @splat(0),
     };
 
     const params_off = @sizeOf(proto.RpcMessageHeader) + @sizeOf(proto.RpcGspRmAlloc);
@@ -422,7 +422,7 @@ pub fn buildControlElement(
     const total = @sizeOf(proto.RpcMessageHeader) + body_len;
     std.debug.assert(out.len >= total);
 
-    writeRpcHeader(out, @intFromEnum(proto.Function.gsp_rm_control), body_len);
+    writeRpcHeader(out, @backingInt(proto.Function.gsp_rm_control), body_len);
 
     const c: *proto.RpcGspRmControl = @ptrCast(@alignCast(&out[@sizeOf(proto.RpcMessageHeader)]));
     c.* = .{
@@ -549,7 +549,7 @@ test "two-ended ring round-trips an RPC end to end (no GPU)" {
 
     // GSP drains it: verifies checksum + seqNum, reads function + payload.
     const got = try gsp.recv();
-    try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_alloc), got.function);
+    try testing.expectEqual(@backingInt(proto.Function.gsp_rm_alloc), got.function);
     try testing.expectEqual(@as(u32, 0), got.seq_num);
     try testing.expectEqual(@as(u32, 1), got.elem_count);
     const alloc_hdr: *const proto.RpcGspRmAlloc = @ptrCast(@alignCast(&got.rpc[@sizeOf(proto.RpcMessageHeader)]));
@@ -558,12 +558,12 @@ test "two-ended ring round-trips an RPC end to end (no GPU)" {
 
     // GSP replies on the msgq with a GSP_INIT_DONE-style event element.
     var reply: [64]u8 = undefined;
-    writeRpcHeader(&reply, @intFromEnum(proto.Event.gsp_init_done), 0);
+    writeRpcHeader(&reply, @backingInt(proto.Event.gsp_init_done), 0);
     try gsp.send(reply[0..@sizeOf(proto.RpcMessageHeader)]);
 
     // Host receives the reply and round-trips.
     const r = try host.recv();
-    try testing.expectEqual(@intFromEnum(proto.Event.gsp_init_done), r.function);
+    try testing.expectEqual(@backingInt(proto.Event.gsp_init_done), r.function);
     try testing.expectEqual(@as(u32, 0), r.seq_num);
 
     // Ring is empty again on both ends.
@@ -611,14 +611,14 @@ test "two-ended ring: seqNum increments and a multi-slot payload spans slots" {
     try host.send(out[0..n1]);
     const got1 = try gsp.recv();
     try testing.expectEqual(@as(u32, 1), got1.seq_num);
-    try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_control), got1.function);
+    try testing.expectEqual(@backingInt(proto.Function.gsp_rm_control), got1.function);
 }
 
 test "buildAllocElement on-wire bytes for a known root alloc" {
     // NV01_ROOT alloc: function 103, params == an Os21-shaped blob. Assert the
     // exact header fields land on the wire.
     var out: [128]u8 = undefined;
-    const params = [_]u8{0xAA} ** 8; // stand-in 8-byte params blob
+    const params: [8]u8 = @splat(0xAA); // stand-in 8-byte params blob
     const nv01_root: u32 = 0x0;
     const n = buildAllocElement(&out, 0x1000, 0x2000, 0x3000, nv01_root, 0x5, &params);
 
@@ -627,7 +627,7 @@ test "buildAllocElement on-wire bytes for a known root alloc" {
     const rpc: *const proto.RpcMessageHeader = @ptrCast(@alignCast(&out[0]));
     try testing.expectEqual(proto.RpcMessageHeader.HEADER_VERSION, rpc.header_version);
     try testing.expectEqual(proto.RpcMessageHeader.SIGNATURE, rpc.signature);
-    try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_alloc), rpc.function);
+    try testing.expectEqual(@backingInt(proto.Function.gsp_rm_alloc), rpc.function);
     // length == rpc header(32) + alloc header(32) + params(8) == 72. writeRpcHeader
     // sets length = sizeof(rpc_message_header_v) + body_len.
     try testing.expectEqual(@as(u32, @sizeOf(proto.RpcMessageHeader) + @sizeOf(proto.RpcGspRmAlloc) + 8), rpc.length);
@@ -644,12 +644,12 @@ test "buildAllocElement on-wire bytes for a known root alloc" {
 
 test "buildControlElement marshals the 595.71.05 control header" {
     var out: [128]u8 = undefined;
-    const params = [_]u8{0xBB} ** 16;
+    const params: [16]u8 = @splat(0xBB);
     const n = buildControlElement(&out, 0xC11E, 0x0B7E, 0x20800142, 0, &params);
     try testing.expectEqual(@as(usize, 32 + 40 + 16), n);
 
     const rpc: *const proto.RpcMessageHeader = @ptrCast(@alignCast(&out[0]));
-    try testing.expectEqual(@intFromEnum(proto.Function.gsp_rm_control), rpc.function);
+    try testing.expectEqual(@backingInt(proto.Function.gsp_rm_control), rpc.function);
 
     const c: *const proto.RpcGspRmControl = @ptrCast(@alignCast(&out[32]));
     try testing.expectEqual(@as(sdk.NvHandle, 0xC11E), c.h_client);

@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) void {
     // A convenience run step (Linux only - the UEFI build is run on the metal).
     if (!is_uefi) {
         const run_probe = b.addRunArtifact(info);
-        if (b.args) |args| run_probe.addArgs(args);
+        run_probe.addPassthruArgs();
         const run_step = b.step("run-nvidia-info", "Run the nvidia-info probe (needs an NVIDIA GPU)");
         run_step.dependOn(&run_probe.step);
     }

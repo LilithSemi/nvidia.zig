@@ -551,7 +551,7 @@ pub const Boot = struct {
                 ring.Error.Empty => continue,
                 else => return e,
             };
-            if (got.function == @intFromEnum(proto.Event.gsp_init_done)) return;
+            if (got.function == @backingInt(proto.Event.gsp_init_done)) return;
         }
         return Error.InitTimeout;
     }

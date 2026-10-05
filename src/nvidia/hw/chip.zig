@@ -98,7 +98,7 @@ pub const ChipId = struct {
     minor_revision: u8,
 
     pub fn arch(self: ChipId) Architecture {
-        return @enumFromInt(self.architecture);
+        return @fromBackingInt(@intCast(self.architecture));
     }
 };
 
@@ -184,7 +184,7 @@ test "archFromBoot0 folds in the high architecture bit" {
 }
 
 test "identify reads the right offsets off a fake bar" {
-    var backing = [_]u8{0} ** 0x1000;
+    var backing: [0x1000]u8 = @splat(0);
     const bar = mmio.Bar.init(@intFromPtr(&backing), backing.len);
     const p0: *volatile u32 = @ptrFromInt(bar.base + NV_PMC_BOOT_0);
     const p42: *volatile u32 = @ptrFromInt(bar.base + NV_PMC_BOOT_42);

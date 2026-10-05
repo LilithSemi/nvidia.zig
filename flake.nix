@@ -57,7 +57,7 @@
           default = pkgs.mkShell {
             name = "nvidia-zig-dev-shell";
             packages = with pkgs; [
-              zig
+              zig_0_17
             ];
           };
         }
@@ -74,13 +74,13 @@
 
             src = lib.cleanSource ./.;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-UC3QtEtb+ZiC5MAbBJH3yrMaBIWhnPyo6Kep+t7erCw=";
+              hash = "sha256-1qjGFk3Vq16sbX6u2ZEZWKdtweilugIk30uirT4olnM=";
             };
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             postConfigure = ''

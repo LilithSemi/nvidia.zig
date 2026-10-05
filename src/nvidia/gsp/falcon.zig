@@ -421,7 +421,7 @@ pub const Falcon = struct {
 const testing = std.testing;
 
 test "mailbox r/w round-trips through the fake Bar at base+0x40/0x44" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -435,7 +435,7 @@ test "mailbox r/w round-trips through the fake Bar at base+0x40/0x44" {
 }
 
 test "reset writes IDLESTATE clear, IRQMCLR all, ENABLE in order" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -467,7 +467,7 @@ test "dmaCmd encodes size field 0x600 + IMEM + secure bits" {
 }
 
 test "loadDma emits DMATRFBASE/MOFFS/FBOFFS/CMD with exact values per chunk" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -490,7 +490,7 @@ test "loadDma emits DMATRFBASE/MOFFS/FBOFFS/CMD with exact values per chunk" {
 test "loadDmem single chunk writes the exact DMEM DMA values" {
     // A single 256-byte DMEM chunk from phys 0x1000, mem_off 0: assert the exact
     // register values the builder lands (init + the chunk's three regs).
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -506,7 +506,7 @@ test "loadDmem single chunk writes the exact DMEM DMA values" {
 }
 
 test "loadImem emits the FBIF prep then the IMEM DMA" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -522,7 +522,7 @@ test "loadImem emits the FBIF prep then the IMEM DMA" {
 }
 
 test "start writes BOOTVEC then CPUCTL STARTCPU" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -532,7 +532,7 @@ test "start writes BOOTVEC then CPUCTL STARTCPU" {
 }
 
 test "isHalted reads CPUCTL and masks bit 0x10" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x1000);
+    var backing: [GSP_BASE + 0x1000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -546,7 +546,7 @@ test "isHalted reads CPUCTL and masks bit 0x10" {
 }
 
 test "riscvBootKick writes BR sig, engine id, ucode id, BCR_CTRL in EXACT order" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x2000);
+    var backing: [GSP_BASE + 0x2000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE); // riscv_base defaults to 0x1000
 
@@ -572,7 +572,7 @@ test "riscvBootKick writes BR sig, engine id, ucode id, BCR_CTRL in EXACT order"
 }
 
 test "riscvActive reads addr2+0x388 and masks bit 0x80" {
-    var backing = [_]u8{0} ** (GSP_BASE + 0x2000);
+    var backing: [GSP_BASE + 0x2000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, GSP_BASE);
 
@@ -587,7 +587,7 @@ test "riscvActive reads addr2+0x388 and masks bit 0x80" {
 }
 
 test "SEC2 base addresses fold correctly (the booter engine)" {
-    var backing = [_]u8{0} ** (SEC2_BASE + 0x2000);
+    var backing: [SEC2_BASE + 0x2000]u8 = @splat(0);
     const bar = hw.Bar.init(@intFromPtr(&backing), backing.len);
     const f = Falcon.init(bar, SEC2_BASE);
 

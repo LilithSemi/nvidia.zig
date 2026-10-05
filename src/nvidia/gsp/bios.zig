@@ -647,7 +647,7 @@ const SynthVbios = struct {
     const DMEM_LOAD: u32 = 0x200;
 
     fn build() SynthVbios {
-        var s: SynthVbios = .{ .buf = [_]u8{0} ** 4096 };
+        var s: SynthVbios = .{ .buf = @splat(0) };
         const b = &s.buf;
 
         // PCIR signature.
@@ -772,7 +772,7 @@ test "BIT parse reports not-found for a missing id" {
 
 test "BIT parse rejects a truncated header" {
     // A buffer that has the token at the very end leaves no room for the header.
-    var buf: [SynthVbios.BIT_OFF + 6]u8 = [_]u8{0} ** (SynthVbios.BIT_OFF + 6);
+    var buf: [SynthVbios.BIT_OFF + 6]u8 = @splat(0);
     buf[0] = PCIR_SIG0;
     buf[1] = PCIR_SIG1;
     @memcpy(buf[SynthVbios.BIT_OFF .. SynthVbios.BIT_OFF + BIT_TOKEN.len], &BIT_TOKEN);
@@ -874,7 +874,7 @@ test "extractAndPatchFrts errors on a too-small output buffer" {
 
 test "readVbiosProm copies words out of a fake PROM aperture" {
     // A fake BAR whose backing is a pretend ROM at PROM_OFFSET.
-    var backing: [PROM_OFFSET + 64]u8 = [_]u8{0} ** (PROM_OFFSET + 64);
+    var backing: [PROM_OFFSET + 64]u8 = @splat(0);
     backing[PROM_OFFSET + 0] = PCIR_SIG0;
     backing[PROM_OFFSET + 1] = PCIR_SIG1;
     writeInt(u32, backing[PROM_OFFSET + 4 ..][0..4], 0xDEADBEEF, .little);
