@@ -219,6 +219,29 @@ pub const Client = struct {
         return self.t.control(dev, h_object, cmd, params, params_size);
     }
 
+    /// Deschedule one channel and wait up to `timeout_us` for its pending work
+    /// to complete. Success is the RM quiescence boundary for referenced memory.
+    pub fn idleChannel(self: *Client, dev: Device, channel: Channel, timeout_us: u32) Error!void {
+        if (timeout_us == 0) return error.InvalidTimeout;
+        var params = sdk.IdleChannelsParams{
+            .h_device = dev.device,
+            .h_channel = channel.handle,
+            .num_channels = 1,
+            .ph_clients = 0,
+            .ph_devices = 0,
+            .ph_channels = 0,
+            .flags = sdk.idle_channel_flags.COPY_CHANNEL,
+            .timeout_us = timeout_us,
+        };
+        try self.control(
+            dev,
+            dev.client,
+            sdk.NV0000_CTRL_CMD_IDLE_CHANNELS,
+            &params,
+            @sizeOf(sdk.IdleChannelsParams),
+        );
+    }
+
     /// Query the GPU id (NV2080_CTRL_CMD_GPU_GET_ID, on the subdevice).
     pub fn getGpuId(self: *Client, dev: Device) Error!sdk.NvU32 {
         var p = sdk.GpuGetIdParams{};
@@ -438,6 +461,13 @@ pub const Client = struct {
         return self.t.rmAlloc(dev.client, channel.handle, self.t.newHandle(), class, null, 0);
     }
 };
+
+test "idleChannel rejects a zero timeout before transport access" {
+    var client: Client = undefined;
+    const dev: Device = undefined;
+    const channel: Channel = undefined;
+    try std.testing.expectError(error.InvalidTimeout, client.idleChannel(dev, channel, 0));
+}
 
 /// A submission queue over a bound+scheduled GPFIFO channel: push GP_ENTRYs to
 /// its ring and ring the USERMODE doorbell so the GPU fetches and executes them.

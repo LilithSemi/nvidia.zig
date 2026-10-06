@@ -8,6 +8,7 @@
 //! are all emitted on subchannel 1.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("sdk.zig");
 
 pub const BLACKWELL_COMPUTE_B: sdk.NvV32 = 0xcec0;
@@ -337,6 +338,42 @@ pub const Peer = struct {
     memory: rm.Memory,
 };
 
+/// Whether peer-copy resources can be reused or released after a submission.
+pub const CopyState = enum {
+    ready,
+    recovery_required,
+    quiescent_disabled,
+};
+
+const RecoveryOps = struct {
+    context: *anyopaque,
+    idle: *const fn (*anyopaque, u32) rm.Error!void,
+    schedule: *const fn (*anyopaque) rm.Error!void,
+};
+
+fn recoverCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    switch (state.*) {
+        .ready => return,
+        .recovery_required => {
+            try ops.idle(ops.context, timeout_us);
+            state.* = .quiescent_disabled;
+        },
+        .quiescent_disabled => {},
+    }
+    ops.schedule(ops.context) catch |err| return err;
+    state.* = .ready;
+}
+
+fn quiesceCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    switch (state.*) {
+        .ready, .quiescent_disabled => {},
+        .recovery_required => {
+            try ops.idle(ops.context, timeout_us);
+            state.* = .quiescent_disabled;
+        },
+    }
+}
+
 /// The transfer size at which the copy engine overtakes the inline path on this
 /// hardware. Below it, put the payload in the pushbuffer with
 /// `Stream.uploadInline`; above it, hand the copy engine a source buffer with
@@ -416,6 +453,8 @@ pub const Runner = struct {
     copy_push: Buffer = undefined,
     copy_sem: Buffer = undefined,
     copy_seq: u32 = 0,
+    copy_state: CopyState = .ready,
+    suppress_next_copy_poll: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     doorbell: []u8 = &.{},
     allocations: [MAX_ALLOCATIONS]Allocation = undefined,
     allocation_count: usize = 0,
@@ -570,6 +609,7 @@ pub const Runner = struct {
     /// Copy `bytes` from `src_va` to `dst_va` on the copy engine and wait for the
     /// engine's own semaphore to land.
     pub fn copyLinear(self: *Runner, dst_va: u64, src_va: u64, bytes: u32) !void {
+        try self.requireCopyReady();
         try self.ensureCopyChannel();
         self.copy_seq += 1;
         var s = copy.Stream{ .buf = self.copy_push.slice(u32) };
@@ -584,10 +624,15 @@ pub const Runner = struct {
         const semp: *volatile u32 = @ptrCast(@alignCast(self.copy_sem.bytes.ptr));
         semp.* = 0;
         self.copy_queue.submit(self.copy_push.va, s.dwords());
-        var spins: u64 = 0;
-        while (spins < SPIN_LIMIT) : (spins += 1) {
-            if (semp.* == self.copy_seq) return;
+        const poll_completion = if (builtin.is_test) !self.suppress_next_copy_poll else true;
+        if (builtin.is_test) self.suppress_next_copy_poll = false;
+        if (poll_completion) {
+            var spins: u64 = 0;
+            while (spins < SPIN_LIMIT) : (spins += 1) {
+                if (semp.* == self.copy_seq) return;
+            }
         }
+        self.copy_state = .recovery_required;
         return error.CopyTimeout;
     }
 
@@ -599,6 +644,7 @@ pub const Runner = struct {
     /// runtime transfer request, not a value the caller chose in source, so
     /// they are never trusted.
     pub fn copyFromPeer(self: *Runner, dst: Buffer, dst_offset: u32, src: Peer, src_offset: u32, bytes: u32) !void {
+        try self.requireCopyReady();
         const dst_end = std.math.add(u64, @as(u64, dst_offset), @as(u64, bytes)) catch
             return error.OutOfBounds;
         if (dst_end > @as(u64, dst.bytes.len)) return error.OutOfBounds;
@@ -618,10 +664,84 @@ pub const Runner = struct {
         try self.copyLinear(dst.va + @as(u64, dst_offset), src.va + @as(u64, src_offset), bytes);
     }
 
+    /// Report whether peer-copy recovery is required before memory release.
+    pub fn peerCopyState(self: *const Runner) CopyState {
+        return self.copy_state;
+    }
+
+    /// Quiesce a timed-out copy channel through RM, then make it schedulable
+    /// again. An idle failure leaves all Runner resources owned and in place.
+    pub fn recoverPeerCopy(self: *Runner, timeout_us: u32) rm.Error!void {
+        try self.recoverPeerCopyWith(timeout_us, self.recoveryOps());
+    }
+
+    /// Tear down a Runner after first quiescing a timed-out copy channel. A
+    /// recovery failure leaves the complete Runner valid for a later retry.
+    pub fn deinitChecked(self: *Runner, timeout_us: u32) rm.Error!void {
+        try self.deinitCheckedWith(timeout_us, self.recoveryOps());
+    }
+
+    /// Precondition: no copy is waiting for timeout recovery. Use
+    /// `deinitChecked` when `peerCopyState()` is `recovery_required`.
     pub fn deinit(self: *Runner) void {
+        self.requireCopyReleasable();
+        self.deinitQuiescent();
+    }
+
+    fn deinitQuiescent(self: *Runner) void {
         self.releaseOwnedResources();
         self.client.freeDevice(self.dev);
         self.client.deinit();
+    }
+
+    fn requireCopyReady(self: *const Runner) !void {
+        return switch (self.copy_state) {
+            .ready => {},
+            .recovery_required => error.CopyRecoveryRequired,
+            .quiescent_disabled => error.CopyChannelUnavailable,
+        };
+    }
+
+    fn requireCopyReleasable(self: *const Runner) void {
+        if (self.copy_state == .recovery_required) {
+            @panic("copy recovery required before releasing Runner memory");
+        }
+    }
+
+    fn recoveryOps(self: *Runner) RecoveryOps {
+        return .{
+            .context = self,
+            .idle = idleCopyChannel,
+            .schedule = scheduleCopyChannel,
+        };
+    }
+
+    fn idleCopyChannel(context: *anyopaque, timeout_us: u32) rm.Error!void {
+        const self: *Runner = @ptrCast(@alignCast(context));
+        const channel = self.copy_channel orelse
+            @panic("copy recovery requires an allocated copy channel");
+        try self.client.idleChannel(self.dev, channel, timeout_us);
+    }
+
+    fn scheduleCopyChannel(context: *anyopaque) rm.Error!void {
+        const self: *Runner = @ptrCast(@alignCast(context));
+        const channel = self.copy_channel orelse
+            @panic("copy reschedule requires an allocated copy channel");
+        try self.client.scheduleChannel(self.dev, channel, true);
+    }
+
+    fn recoverPeerCopyWith(self: *Runner, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+        try recoverCopyState(&self.copy_state, timeout_us, ops);
+    }
+
+    fn deinitCheckedWith(self: *Runner, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+        try quiesceCopyState(&self.copy_state, timeout_us, ops);
+        self.deinitQuiescent();
+    }
+
+    fn suppressNextCopyPollForTest(self: *Runner) void {
+        if (!builtin.is_test) @compileError("copy poll suppression is test-only");
+        self.suppress_next_copy_poll = true;
     }
 
     fn releaseOwnedResources(self: *Runner) void {
@@ -743,6 +863,7 @@ pub const Runner = struct {
     /// Release a buffer returned by `alloc`. All copies of `buffer` become
     /// invalid when this function returns.
     pub fn freeBuffer(self: *Runner, buffer: Buffer) void {
+        self.requireCopyReleasable();
         const index = self.findAllocation(buffer.memory) orelse unreachable;
         self.releaseAllocation(index);
     }
@@ -768,6 +889,7 @@ pub const Runner = struct {
 
     /// Release a Peer returned by `importPeer`.
     pub fn releasePeer(self: *Runner, imported: Peer) void {
+        self.requireCopyReleasable();
         const index = self.findAllocation(imported.memory) orelse unreachable;
         self.releaseAllocation(index);
     }
@@ -844,6 +966,92 @@ pub const Runner = struct {
         return self.submitAndWait(s.dwords());
     }
 };
+
+const RecoveryEvent = enum {
+    idle,
+    schedule,
+};
+
+const RecoveryFake = struct {
+    events: [2]RecoveryEvent = undefined,
+    event_count: usize = 0,
+    timeout_us: u32 = 0,
+    idle_error: ?rm.Error = null,
+    schedule_error: ?rm.Error = null,
+
+    fn ops(self: *RecoveryFake) RecoveryOps {
+        return .{
+            .context = self,
+            .idle = idle,
+            .schedule = schedule,
+        };
+    }
+
+    fn idle(context: *anyopaque, timeout_us: u32) rm.Error!void {
+        const self: *RecoveryFake = @ptrCast(@alignCast(context));
+        self.events[self.event_count] = .idle;
+        self.event_count += 1;
+        self.timeout_us = timeout_us;
+        if (self.idle_error) |err| return err;
+    }
+
+    fn schedule(context: *anyopaque) rm.Error!void {
+        const self: *RecoveryFake = @ptrCast(@alignCast(context));
+        self.events[self.event_count] = .schedule;
+        self.event_count += 1;
+        if (self.schedule_error) |err| return err;
+    }
+};
+
+test "copy recovery idles before it reschedules" {
+    var state: CopyState = .recovery_required;
+    var fake = RecoveryFake{};
+
+    try recoverCopyState(&state, 37, fake.ops());
+
+    try std.testing.expectEqual(CopyState.ready, state);
+    try std.testing.expectEqual(@as(u32, 37), fake.timeout_us);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{ .idle, .schedule }, fake.events[0..fake.event_count]);
+}
+
+test "idle failure leaves copy recovery required" {
+    var state: CopyState = .recovery_required;
+    var fake = RecoveryFake{ .idle_error = error.ControlFailed };
+
+    try std.testing.expectError(error.ControlFailed, recoverCopyState(&state, 41, fake.ops()));
+
+    try std.testing.expectEqual(CopyState.recovery_required, state);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, fake.events[0..fake.event_count]);
+}
+
+test "reschedule failure leaves copy quiescent and disabled" {
+    var state: CopyState = .recovery_required;
+    var fake = RecoveryFake{ .schedule_error = error.ControlFailed };
+
+    try std.testing.expectError(error.ControlFailed, recoverCopyState(&state, 43, fake.ops()));
+
+    try std.testing.expectEqual(CopyState.quiescent_disabled, state);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{ .idle, .schedule }, fake.events[0..fake.event_count]);
+
+    fake = RecoveryFake{};
+    try recoverCopyState(&state, 47, fake.ops());
+    try std.testing.expectEqual(CopyState.ready, state);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.schedule}, fake.events[0..fake.event_count]);
+}
+
+test "checked teardown quiesces without rescheduling" {
+    var state: CopyState = .recovery_required;
+    var fake = RecoveryFake{};
+
+    try quiesceCopyState(&state, 53, fake.ops());
+
+    try std.testing.expectEqual(CopyState.quiescent_disabled, state);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, fake.events[0..fake.event_count]);
+
+    fake = RecoveryFake{};
+    try quiesceCopyState(&state, 59, fake.ops());
+    try std.testing.expectEqual(@as(usize, 0), fake.event_count);
+}
 
 test "live: freeBuffer releases its tracked CPU and GPU mappings" {
     var runner = try Runner.init();
@@ -922,7 +1130,79 @@ test "live: importPeer + copyFromPeer takes the copy-engine arm for VRAM" {
     try std.testing.expect(!preferMemcpyForPeerCopy(dst_buf.memory.location, peer.memory.location));
 
     try b.copyFromPeer(dst_buf, 0, peer, 0, words * 4);
+    try std.testing.expectEqual(CopyState.ready, b.peerCopyState());
     try expectIndexPattern(dst_buf, words, 0xFACE_0000);
+}
+
+fn deinitAfterCopyTest(runner: *Runner) void {
+    switch (runner.peerCopyState()) {
+        .ready, .quiescent_disabled => runner.deinit(),
+        .recovery_required => runner.deinitChecked(1_000_000) catch
+            @panic("failed to quiesce copy engine during test cleanup"),
+    }
+}
+
+test "live: forced copy poll timeout requires and recovers quiescence" {
+    var source_runner = try Runner.init();
+    defer source_runner.deinit();
+    var runner = try Runner.init();
+    defer deinitAfterCopyTest(&runner);
+
+    const words = 1024;
+    const src = try source_runner.alloc(.vram, words * 4);
+    defer source_runner.freeBuffer(src);
+    const dst = try runner.alloc(.vram, words * 4);
+    fillIndexPattern(src.slice(u32), words, 0xC0DE_0000);
+    const peer = try runner.importPeer(&source_runner, src);
+    const allocation_count_before_copy = runner.allocation_count;
+
+    runner.suppressNextCopyPollForTest();
+    try std.testing.expectError(error.CopyTimeout, runner.copyFromPeer(dst, 0, peer, 0, words * 4));
+    const retained_allocation_count = runner.allocation_count;
+    try std.testing.expectEqual(CopyState.recovery_required, runner.peerCopyState());
+    try std.testing.expect(retained_allocation_count > allocation_count_before_copy);
+    try std.testing.expectError(error.CopyRecoveryRequired, runner.copyFromPeer(dst, 0, peer, 0, words * 4));
+    try std.testing.expectEqual(retained_allocation_count, runner.allocation_count);
+
+    try runner.recoverPeerCopy(1_000_000);
+    try std.testing.expectEqual(CopyState.ready, runner.peerCopyState());
+    try expectIndexPattern(dst, words, 0xC0DE_0000);
+    try runner.copyFromPeer(dst, 0, peer, 0, words * 4);
+
+    runner.releasePeer(peer);
+    runner.freeBuffer(dst);
+    try std.testing.expectEqual(retained_allocation_count - 2, runner.allocation_count);
+}
+
+test "live: failed checked teardown retains every Runner allocation" {
+    var runner = try Runner.init();
+    const allocation_count = runner.allocation_count;
+    const compute_channel = runner.channel;
+    const vaspace = runner.vaspace;
+    runner.copy_state = .recovery_required;
+    var fake = RecoveryFake{ .idle_error = error.ControlFailed };
+
+    try std.testing.expectError(error.ControlFailed, runner.deinitCheckedWith(61, fake.ops()));
+
+    try std.testing.expectEqual(CopyState.recovery_required, runner.peerCopyState());
+    try std.testing.expectEqual(allocation_count, runner.allocation_count);
+    try std.testing.expectEqual(compute_channel.?.handle, runner.channel.?.handle);
+    try std.testing.expectEqual(vaspace, runner.vaspace);
+
+    fake = RecoveryFake{};
+    try runner.deinitCheckedWith(67, fake.ops());
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, fake.events[0..fake.event_count]);
+}
+
+test "live: checked teardown from disabled does not reschedule" {
+    var runner = try Runner.init();
+    runner.copy_state = .quiescent_disabled;
+    var fake = RecoveryFake{};
+
+    try std.testing.expectError(error.CopyChannelUnavailable, runner.copyLinear(0, 0, 4));
+    try runner.deinitCheckedWith(71, fake.ops());
+
+    try std.testing.expectEqual(@as(usize, 0), fake.event_count);
 }
 
 test "live: copyFromPeer applies dst_offset and src_offset to the correct side" {

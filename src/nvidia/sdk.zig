@@ -208,6 +208,28 @@ pub const Os54Params = extern struct {
     status: NvV32,
 };
 
+pub const NV0000_CTRL_CMD_IDLE_CHANNELS: NvU32 = 0x283;
+
+pub const idle_channel_flags = struct {
+    pub const BEHAVIOR_SLEEP: NvU32 = 1;
+    pub const CHANNEL_SINGLE: NvU32 = 1 << 4;
+    pub const IDLE_CE0: NvU32 = 0x400 << 8;
+    pub const COPY_CHANNEL: NvU32 = BEHAVIOR_SLEEP | CHANNEL_SINGLE | IDLE_CE0;
+};
+
+/// NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS (ctrl0000gpu.h). In single-channel
+/// mode, RM reads `h_device` and `h_channel` and ignores the three list pointers.
+pub const IdleChannelsParams = extern struct {
+    h_device: NvHandle,
+    h_channel: NvHandle,
+    num_channels: NvV32,
+    ph_clients: NvP64 align(8),
+    ph_devices: NvP64 align(8),
+    ph_channels: NvP64 align(8),
+    flags: NvV32,
+    timeout_us: NvV32,
+};
+
 /// NV_VASPACE_ALLOCATION_PARAMETERS (nvos.h): pAllocParms for FERMI_VASPACE_A.
 /// All-zero requests a default GPU virtual address space.
 pub const VaSpaceAllocParams = extern struct {
@@ -539,6 +561,17 @@ test "RM struct layouts match the NVIDIA ABI" {
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(Nvos33WithFd, "fd"));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Os54Params));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(Os54Params, "params"));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(IdleChannelsParams));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(IdleChannelsParams));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(IdleChannelsParams, "h_device"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(IdleChannelsParams, "h_channel"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(IdleChannelsParams, "num_channels"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(IdleChannelsParams, "ph_clients"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(IdleChannelsParams, "ph_devices"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(IdleChannelsParams, "ph_channels"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(IdleChannelsParams, "flags"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(IdleChannelsParams, "timeout_us"));
+    try std.testing.expectEqual(@as(NvU32, 0x0004_0011), idle_channel_flags.COPY_CHANNEL);
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(VaSpaceAllocParams));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(VaSpaceAllocParams, "va_base"));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(VirtMemAllocParams));

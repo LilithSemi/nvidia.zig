@@ -344,11 +344,7 @@ pub const Transport = struct {
         };
         const req = ioctl.iowr(ioctl.NV_ESC_RM_CONTROL, sdk.Os54Params);
         const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&p));
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            else => return error.IoctlFailed,
-        }
-        if (p.status != 0) return error.ControlFailed;
+        try validateControlResponse(std.os.linux.errno(rc), p.status);
     }
 
     /// Bind a physical memory object into `vaspace` at GPU virtual address
@@ -398,6 +394,17 @@ pub const Transport = struct {
         self.rmFree(dev.client, dev.device, mapping.virtual);
     }
 };
+
+fn validateControlResponse(errno: std.os.linux.E, status: sdk.NvV32) Error!void {
+    if (errno != .SUCCESS) return error.IoctlFailed;
+    if (status != 0) return error.ControlFailed;
+}
+
+test "control response reports ioctl and RM failures separately" {
+    try std.testing.expectError(error.IoctlFailed, validateControlResponse(.INVAL, 0));
+    try std.testing.expectError(error.ControlFailed, validateControlResponse(.SUCCESS, 1));
+    try validateControlResponse(.SUCCESS, 0);
+}
 
 fn checkVersionFd(fd: std.posix.fd_t, cmd: sdk.NvU32, ver: []const u8) Error!sdk.RmApiVersion {
     var p = sdk.RmApiVersion{
