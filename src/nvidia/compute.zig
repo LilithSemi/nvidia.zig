@@ -453,11 +453,66 @@ pub const ComputeState = enum {
     quiescent_disabled,
 };
 
+pub const PublishHostWritesError = error{
+    NotImplemented,
+    InvalidArgument,
+    InvalidBuffer,
+    AddressOverflow,
+    OutOfBounds,
+    ComputeRecoveryRequired,
+    CopyRecoveryRequired,
+};
+
 const RecoveryOps = struct {
     context: *anyopaque,
     idle: *const fn (*anyopaque, u32) rm.Error!void,
     schedule: *const fn (*anyopaque) rm.Error!void,
 };
+
+const HostWriteOps = struct {
+    context: *anyopaque,
+    compiler_barrier: *const fn (*anyopaque) void,
+    memory_fence: *const fn (*anyopaque) void,
+    read_byte: *const fn (*anyopaque, *const volatile u8) u8,
+};
+
+fn hostWriteOps(context: *anyopaque) HostWriteOps {
+    return .{
+        .context = context,
+        .compiler_barrier = hostCompilerBarrier,
+        .memory_fence = hostMemoryFence,
+        .read_byte = readHostByte,
+    };
+}
+
+fn hostCompilerBarrier(_: *anyopaque) void {
+    asm volatile ("" ::: .{ .memory = true });
+}
+
+fn hostMemoryFence(_: *anyopaque) void {
+    switch (comptime builtin.cpu.arch) {
+        .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("dsb sy" ::: .{ .memory = true }),
+        else => unreachable,
+    }
+}
+
+fn readHostByte(_: *anyopaque, address: *const volatile u8) u8 {
+    return address.*;
+}
+
+fn completeHostWrites(location: rm.Memory.Location, final_byte: *const volatile u8, ops: HostWriteOps) void {
+    ops.compiler_barrier(ops.context);
+    ops.memory_fence(ops.context);
+    switch (location) {
+        .system, .system_wc => {},
+        .vram => {
+            _ = ops.read_byte(ops.context, final_byte);
+            ops.memory_fence(ops.context);
+        },
+    }
+    ops.compiler_barrier(ops.context);
+}
 
 fn recoverState(comptime State: type, state: *State, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
     switch (state.*) {
@@ -589,6 +644,7 @@ pub const Runner = struct {
         memory: rm.Memory,
         cpu_mapping: ?rm.Mapping = null,
         gpu_mapping: ?rm.GpuMapping = null,
+        public_buffer_extent: ?[]u8 = null,
     };
 
     /// Where the bump allocator starts, and the step between allocations. One
@@ -658,10 +714,10 @@ pub const Runner = struct {
         const userd_cpu = try self.mapToCpu(userd);
 
         // Code and descriptor are write-combined: the CPU only writes them.
-        self.code = try self.alloc(.system_wc, CODE_BYTES);
-        self.descriptor = try self.alloc(.system_wc, MAX_BATCH * QMD_DWORDS * 4);
-        self.push = try self.alloc(.system, PUSH_BYTES);
-        self.sem = try self.alloc(.system_wc, 0x1000);
+        self.code = try self.allocInternal(.system_wc, CODE_BYTES);
+        self.descriptor = try self.allocInternal(.system_wc, MAX_BATCH * QMD_DWORDS * 4);
+        self.push = try self.allocInternal(.system, PUSH_BYTES);
+        self.sem = try self.allocInternal(.system_wc, 0x1000);
 
         const ch = try self.client.allocChannel(
             dev,
@@ -710,8 +766,8 @@ pub const Runner = struct {
         const gpfifo_cpu = try self.mapToCpu(gpfifo);
         const userd = try self.allocMemory(.vram, 0x1000);
         const userd_cpu = try self.mapToCpu(userd);
-        self.copy_push = try self.alloc(.system, 0x1000);
-        self.copy_sem = try self.alloc(.system, 0x1000);
+        self.copy_push = try self.allocInternal(.system, 0x1000);
+        self.copy_sem = try self.allocInternal(.system, 0x1000);
 
         const ch = try self.client.allocChannelEngine(
             self.dev,
@@ -803,6 +859,56 @@ pub const Runner = struct {
     /// Report whether compute recovery is required before memory release.
     pub fn computeState(self: *const Runner) ComputeState {
         return self.compute_state;
+    }
+
+    /// Complete prior CPU writes to one tracked allocation before another GPU
+    /// mapping reads it. This operation does not submit work to either engine.
+    pub fn publishHostWrites(self: *Runner, buffer: Buffer, offset: u64, byte_count: u64) PublishHostWritesError!void {
+        return self.publishHostWritesWith(buffer, offset, byte_count, hostWriteOps(self));
+    }
+
+    fn publishHostWritesWith(self: *Runner, buffer: Buffer, offset: u64, byte_count: u64, ops: HostWriteOps) PublishHostWritesError!void {
+        if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+            return error.NotImplemented;
+        }
+        if (byte_count == 0) return error.InvalidArgument;
+
+        const index = self.findAllocation(buffer.memory) orelse return error.InvalidBuffer;
+        const allocation = self.allocations[index];
+        if (allocation.memory.handle != buffer.memory.handle or
+            allocation.memory.location != buffer.memory.location or
+            allocation.memory.size != buffer.memory.size)
+        {
+            return error.InvalidBuffer;
+        }
+
+        const gpu_mapping = allocation.gpu_mapping orelse return error.InvalidBuffer;
+        const public_buffer = allocation.public_buffer_extent orelse return error.InvalidBuffer;
+        if (gpu_mapping.gpu_va != buffer.va or gpu_mapping.size < public_buffer.len) {
+            return error.InvalidBuffer;
+        }
+
+        const cpu_mapping = allocation.cpu_mapping orelse return error.InvalidBuffer;
+        if (cpu_mapping.bytes.ptr != public_buffer.ptr or cpu_mapping.bytes.len < public_buffer.len) {
+            return error.InvalidBuffer;
+        }
+        if (buffer.bytes.ptr != public_buffer.ptr or buffer.bytes.len != public_buffer.len) {
+            return error.InvalidBuffer;
+        }
+
+        const end = std.math.add(u64, offset, byte_count) catch return error.AddressOverflow;
+        if (end > allocation.memory.size or
+            end > gpu_mapping.size or
+            end > cpu_mapping.bytes.len or
+            end > buffer.bytes.len)
+        {
+            return error.OutOfBounds;
+        }
+        if (self.compute_state == .recovery_required) return error.ComputeRecoveryRequired;
+        if (self.copy_state == .recovery_required) return error.CopyRecoveryRequired;
+
+        const final_byte: *const volatile u8 = @ptrCast(cpu_mapping.bytes.ptr + @as(usize, @intCast(end - 1)));
+        completeHostWrites(allocation.memory.location, final_byte, ops);
     }
 
     /// Quiesce a timed-out copy channel through RM, then make it schedulable
@@ -1037,13 +1143,23 @@ pub const Runner = struct {
 
     /// Allocate `size` bytes, map them to the GPU and to the CPU, and zero them.
     pub fn alloc(self: *Runner, location: rm.Memory.Location, size: u64) !Buffer {
+        return self.allocBuffer(location, size, true);
+    }
+
+    fn allocInternal(self: *Runner, location: rm.Memory.Location, size: u64) !Buffer {
+        return self.allocBuffer(location, size, false);
+    }
+
+    fn allocBuffer(self: *Runner, location: rm.Memory.Location, size: u64, publishable: bool) !Buffer {
         const rounded = std.mem.alignForward(u64, @max(size, 0x1000), 0x1000);
         const mem = try self.allocMemory(location, rounded);
-        errdefer self.releaseAllocation(self.findAllocation(mem) orelse unreachable);
+        const index = self.findAllocation(mem) orelse unreachable;
+        errdefer self.releaseAllocation(index);
         const va = self.takeVa(rounded);
         _ = try self.mapToGpu(mem, va);
         const cpu = try self.mapToCpu(mem);
         @memset(cpu.bytes[0..rounded], 0);
+        if (publishable) self.allocations[index].public_buffer_extent = cpu.bytes[0..rounded];
         return .{ .va = va, .bytes = cpu.bytes[0..rounded], .memory = mem };
     }
 
@@ -1305,6 +1421,407 @@ test "checked teardown quiesces without rescheduling" {
     fake = RecoveryFake{};
     try quiesceCopyState(&state, 59, fake.ops());
     try std.testing.expectEqual(@as(usize, 0), fake.event_count);
+}
+
+const HostWriteEvent = enum {
+    compiler_barrier,
+    memory_fence,
+    read_byte,
+};
+
+const HostWriteFake = struct {
+    events: [8]HostWriteEvent = undefined,
+    event_count: usize = 0,
+    read_address: ?*const volatile u8 = null,
+
+    fn ops(self: *HostWriteFake) HostWriteOps {
+        return .{
+            .context = self,
+            .compiler_barrier = compilerBarrier,
+            .memory_fence = memoryFence,
+            .read_byte = readByte,
+        };
+    }
+
+    fn record(self: *HostWriteFake, event: HostWriteEvent) void {
+        self.events[self.event_count] = event;
+        self.event_count += 1;
+    }
+
+    fn compilerBarrier(context: *anyopaque) void {
+        const self: *HostWriteFake = @ptrCast(@alignCast(context));
+        self.record(.compiler_barrier);
+    }
+
+    fn memoryFence(context: *anyopaque) void {
+        const self: *HostWriteFake = @ptrCast(@alignCast(context));
+        self.record(.memory_fence);
+    }
+
+    fn readByte(context: *anyopaque, address: *const volatile u8) u8 {
+        const self: *HostWriteFake = @ptrCast(@alignCast(context));
+        self.record(.read_byte);
+        self.read_address = address;
+        return address.*;
+    }
+};
+
+const HostWriteFixture = struct {
+    runner: Runner,
+    buffer: Buffer,
+};
+
+fn hostWriteFixture(bytes: []u8, location: rm.Memory.Location) HostWriteFixture {
+    const memory: rm.Memory = .{
+        .handle = 0x91,
+        .size = bytes.len,
+        .location = location,
+    };
+    const buffer: Buffer = .{
+        .va = 0x1234_0000,
+        .bytes = bytes,
+        .memory = memory,
+    };
+    var runner: Runner = undefined;
+    runner.seq = 17;
+    runner.copy_seq = 23;
+    runner.copy_state = .ready;
+    runner.compute_state = .ready;
+    runner.allocation_count = 1;
+    runner.allocations[0] = .{
+        .memory = memory,
+        .cpu_mapping = .{ .bytes = bytes, .fd = -1 },
+        .gpu_mapping = .{ .virtual = 0x92, .gpu_va = buffer.va, .size = bytes.len },
+        .public_buffer_extent = bytes,
+    };
+    return .{ .runner = runner, .buffer = buffer };
+}
+
+fn expectNoHostWriteEvents(fake: *const HostWriteFake) !void {
+    try std.testing.expectEqual(@as(usize, 0), fake.event_count);
+    try std.testing.expectEqual(@as(?*const volatile u8, null), fake.read_address);
+}
+
+test "host write publication uses the location-specific completion sequence" {
+    var bytes: [32]u8 = @splat(0x5a);
+
+    inline for (.{ rm.Memory.Location.system, .system_wc }) |location| {
+        var fixture = hostWriteFixture(&bytes, location);
+        var fake = HostWriteFake{};
+        try fixture.runner.publishHostWritesWith(fixture.buffer, 3, 11, fake.ops());
+        try std.testing.expectEqualSlices(
+            HostWriteEvent,
+            &.{ .compiler_barrier, .memory_fence, .compiler_barrier },
+            fake.events[0..fake.event_count],
+        );
+        try std.testing.expectEqual(@as(?*const volatile u8, null), fake.read_address);
+    }
+
+    var fixture = hostWriteFixture(&bytes, .vram);
+    var fake = HostWriteFake{};
+    try fixture.runner.publishHostWritesWith(fixture.buffer, 3, 11, fake.ops());
+    try std.testing.expectEqualSlices(
+        HostWriteEvent,
+        &.{ .compiler_barrier, .memory_fence, .read_byte, .memory_fence, .compiler_barrier },
+        fake.events[0..fake.event_count],
+    );
+    try std.testing.expectEqual(@intFromPtr(bytes[13..].ptr), @intFromPtr(fake.read_address.?));
+}
+
+test "host write publication rejects forged allocation and mapping identities" {
+    var bytes: [32]u8 = @splat(0x7b);
+    var other: [32]u8 = @splat(0x3c);
+
+    for (0..11) |fault| {
+        var fixture = hostWriteFixture(&bytes, .system);
+        switch (fault) {
+            0 => fixture.buffer.memory.handle += 1,
+            1 => fixture.buffer.memory.location = .vram,
+            2 => fixture.buffer.memory.size += 1,
+            3 => fixture.buffer.va += 0x1000,
+            4 => fixture.runner.allocations[0].gpu_mapping = null,
+            5 => fixture.runner.allocations[0].gpu_mapping.?.size -= 1,
+            6 => fixture.runner.allocations[0].cpu_mapping = null,
+            7 => fixture.buffer.bytes = &other,
+            8 => fixture.buffer.bytes = fixture.buffer.bytes[0 .. fixture.buffer.bytes.len - 1],
+            9 => fixture.runner.allocations[0].public_buffer_extent = null,
+            10 => fixture.runner.allocations[0].cpu_mapping.?.bytes = &other,
+            else => unreachable,
+        }
+        var fake = HostWriteFake{};
+        try std.testing.expectError(
+            error.InvalidBuffer,
+            fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+        );
+        try expectNoHostWriteEvents(&fake);
+    }
+
+    var fixture = hostWriteFixture(&bytes, .system);
+    fixture.runner.allocations[0].cpu_mapping.?.bytes = bytes[0 .. bytes.len - 1];
+    fixture.buffer.bytes = bytes[0 .. bytes.len - 1];
+    var fake = HostWriteFake{};
+    try std.testing.expectError(
+        error.InvalidBuffer,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+
+    var wider: [33]u8 = @splat(0x6d);
+    fixture = hostWriteFixture(wider[0..32], .system);
+    fixture.buffer.bytes = &wider;
+    fake = HostWriteFake{};
+    try std.testing.expectError(
+        error.InvalidBuffer,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+}
+
+test "host write publication keeps tracked mapping padding private" {
+    var bytes: [48]u8 = @splat(0x6c);
+    var fixture = hostWriteFixture(&bytes, .system);
+    fixture.buffer.bytes = bytes[0..32];
+    fixture.runner.allocations[0].public_buffer_extent = bytes[0..32];
+    var padding_before: [16]u8 = undefined;
+    @memcpy(&padding_before, bytes[32..]);
+
+    var fake = HostWriteFake{};
+    try fixture.runner.publishHostWritesWith(fixture.buffer, 31, 1, fake.ops());
+    try std.testing.expectEqualSlices(
+        HostWriteEvent,
+        &.{ .compiler_barrier, .memory_fence, .compiler_barrier },
+        fake.events[0..fake.event_count],
+    );
+
+    fake = HostWriteFake{};
+    try std.testing.expectError(
+        error.OutOfBounds,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 32, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+    try std.testing.expectEqualSlices(u8, &padding_before, bytes[32..]);
+}
+
+test "host write publication checks ranges before engine recovery" {
+    var bytes: [32]u8 = @splat(0x4d);
+    var fixture = hostWriteFixture(&bytes, .system_wc);
+    var fake = HostWriteFake{};
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 0, fake.ops()),
+    );
+    try std.testing.expectError(
+        error.AddressOverflow,
+        fixture.runner.publishHostWritesWith(fixture.buffer, std.math.maxInt(u64), 2, fake.ops()),
+    );
+    try std.testing.expectError(
+        error.OutOfBounds,
+        fixture.runner.publishHostWritesWith(fixture.buffer, bytes.len - 1, 2, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+
+    try fixture.runner.publishHostWritesWith(fixture.buffer, 7, bytes.len - 7, fake.ops());
+    try std.testing.expectEqualSlices(
+        HostWriteEvent,
+        &.{ .compiler_barrier, .memory_fence, .compiler_barrier },
+        fake.events[0..fake.event_count],
+    );
+}
+
+test "host write publication accepts quiescent engines and rejects recovery" {
+    var bytes: [32]u8 = @splat(0x2e);
+
+    inline for (.{ ComputeState.ready, .quiescent_disabled }) |compute_state| {
+        inline for (.{ CopyState.ready, .quiescent_disabled }) |copy_state| {
+            var fixture = hostWriteFixture(&bytes, .system);
+            fixture.runner.compute_state = compute_state;
+            fixture.runner.copy_state = copy_state;
+            var fake = HostWriteFake{};
+            try fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops());
+            try std.testing.expectEqual(@as(usize, 3), fake.event_count);
+        }
+    }
+
+    var fixture = hostWriteFixture(&bytes, .system);
+    fixture.runner.compute_state = .recovery_required;
+    fixture.runner.copy_state = .recovery_required;
+    var fake = HostWriteFake{};
+    try std.testing.expectError(
+        error.ComputeRecoveryRequired,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+
+    fixture.runner.compute_state = .ready;
+    try std.testing.expectError(
+        error.CopyRecoveryRequired,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+}
+
+test "host write publication faults follow validation order" {
+    var bytes: [32]u8 = @splat(0x1f);
+    var fixture = hostWriteFixture(&bytes, .system);
+    fixture.buffer.va += 1;
+    fixture.runner.compute_state = .recovery_required;
+    fixture.runner.copy_state = .recovery_required;
+    var fake = HostWriteFake{};
+    try std.testing.expectError(
+        error.InvalidBuffer,
+        fixture.runner.publishHostWritesWith(fixture.buffer, std.math.maxInt(u64), 2, fake.ops()),
+    );
+
+    fixture = hostWriteFixture(&bytes, .system);
+    fixture.runner.compute_state = .recovery_required;
+    fixture.runner.copy_state = .recovery_required;
+    try std.testing.expectError(
+        error.AddressOverflow,
+        fixture.runner.publishHostWritesWith(fixture.buffer, std.math.maxInt(u64), 2, fake.ops()),
+    );
+    try std.testing.expectError(
+        error.OutOfBounds,
+        fixture.runner.publishHostWritesWith(fixture.buffer, bytes.len, 1, fake.ops()),
+    );
+    try std.testing.expectError(
+        error.ComputeRecoveryRequired,
+        fixture.runner.publishHostWritesWith(fixture.buffer, 0, 1, fake.ops()),
+    );
+    try expectNoHostWriteEvents(&fake);
+}
+
+test "host write publication changes no runner or buffer state" {
+    var bytes: [32]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @intCast(index);
+    const before = bytes;
+    var fixture = hostWriteFixture(&bytes, .vram);
+    const memory = fixture.runner.allocations[0].memory;
+    const cpu_mapping = fixture.runner.allocations[0].cpu_mapping.?;
+    const gpu_mapping = fixture.runner.allocations[0].gpu_mapping.?;
+    const public_buffer = fixture.runner.allocations[0].public_buffer_extent.?;
+    var fake = HostWriteFake{};
+
+    try fixture.runner.publishHostWritesWith(fixture.buffer, 5, 19, fake.ops());
+
+    try std.testing.expectEqualSlices(u8, &before, &bytes);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runner.allocation_count);
+    try std.testing.expectEqual(@as(u32, 17), fixture.runner.seq);
+    try std.testing.expectEqual(@as(u32, 23), fixture.runner.copy_seq);
+    try std.testing.expectEqual(ComputeState.ready, fixture.runner.compute_state);
+    try std.testing.expectEqual(CopyState.ready, fixture.runner.copy_state);
+    try std.testing.expectEqual(memory, fixture.runner.allocations[0].memory);
+    try std.testing.expectEqual(cpu_mapping.bytes.ptr, fixture.runner.allocations[0].cpu_mapping.?.bytes.ptr);
+    try std.testing.expectEqual(cpu_mapping.bytes.len, fixture.runner.allocations[0].cpu_mapping.?.bytes.len);
+    try std.testing.expectEqual(gpu_mapping, fixture.runner.allocations[0].gpu_mapping.?);
+    try std.testing.expectEqual(public_buffer.ptr, fixture.runner.allocations[0].public_buffer_extent.?.ptr);
+    try std.testing.expectEqual(public_buffer.len, fixture.runner.allocations[0].public_buffer_extent.?.len);
+}
+
+test "live: Runner resources are not publishable buffers" {
+    var runner = try Runner.init();
+    defer runner.deinit();
+
+    inline for (.{ runner.code, runner.descriptor, runner.push, runner.sem }) |buffer| {
+        const allocation = runner.allocations[runner.findAllocation(buffer.memory).?];
+        try std.testing.expectEqual(@as(?[]u8, null), allocation.public_buffer_extent);
+        try std.testing.expectError(
+            error.InvalidBuffer,
+            runner.publishHostWrites(buffer, 0, 1),
+        );
+    }
+
+    try runner.ensureCopyChannel();
+    inline for (.{ runner.copy_push, runner.copy_sem }) |buffer| {
+        const allocation = runner.allocations[runner.findAllocation(buffer.memory).?];
+        try std.testing.expectEqual(@as(?[]u8, null), allocation.public_buffer_extent);
+        try std.testing.expectError(
+            error.InvalidBuffer,
+            runner.publishHostWrites(buffer, 0, 1),
+        );
+    }
+}
+
+test "live: public allocation padding is private and peer imports stay unpublishable" {
+    var source_runner = try Runner.initOn(0);
+    defer source_runner.deinit();
+    var destination_runner = try Runner.initOn(0);
+    defer destination_runner.deinit();
+
+    const requested_size = 4097;
+    const public_size = 8192;
+    const buffer = try source_runner.alloc(.system, requested_size);
+    defer source_runner.freeBuffer(buffer);
+    const source_allocation = source_runner.allocations[source_runner.findAllocation(buffer.memory).?];
+    const public_buffer = source_allocation.public_buffer_extent.?;
+    try std.testing.expectEqual(@as(usize, public_size), buffer.bytes.len);
+    try std.testing.expectEqual(buffer.bytes.ptr, public_buffer.ptr);
+    try std.testing.expectEqual(@as(usize, public_size), public_buffer.len);
+    try std.testing.expect(source_allocation.memory.size > public_size);
+    try std.testing.expect(source_allocation.cpu_mapping.?.bytes.len > public_size);
+    try std.testing.expect(source_allocation.gpu_mapping.?.size > public_size);
+
+    const padding: *volatile u8 = @ptrCast(source_allocation.cpu_mapping.?.bytes.ptr + public_size);
+    padding.* = 0xa5;
+    try source_runner.publishHostWrites(buffer, public_size - 1, 1);
+    try std.testing.expectError(
+        error.OutOfBounds,
+        source_runner.publishHostWrites(buffer, public_size, 1),
+    );
+    try std.testing.expectEqual(@as(u8, 0xa5), padding.*);
+
+    const peer = try destination_runner.importPeer(&source_runner, buffer);
+    defer destination_runner.releasePeer(peer);
+    const peer_allocation = destination_runner.allocations[destination_runner.findAllocation(peer.memory).?];
+    try std.testing.expectEqual(@as(?[]u8, null), peer_allocation.public_buffer_extent);
+    const reconstructed: Buffer = .{
+        .va = peer_allocation.gpu_mapping.?.gpu_va,
+        .bytes = peer_allocation.cpu_mapping.?.bytes,
+        .memory = peer_allocation.memory,
+    };
+    try std.testing.expectError(
+        error.InvalidBuffer,
+        destination_runner.publishHostWrites(reconstructed, 0, 1),
+    );
+}
+
+test "live: published host writes are visible through every peer memory path" {
+    var source_runner = try Runner.initOn(0);
+    defer source_runner.deinit();
+    var destination_runner = try Runner.initOn(0);
+    defer destination_runner.deinit();
+    try std.testing.expectEqual(source_runner.gpuId(), destination_runner.gpuId());
+
+    const source_offset: u32 = 3;
+    const destination_offset: u32 = 5;
+    const byte_count: u32 = Runner.PUSH_BYTES + 17;
+    inline for (.{ rm.Memory.Location.system, .system_wc, .vram }) |location| {
+        const source = try source_runner.alloc(location, source_offset + byte_count + 1);
+        defer source_runner.freeBuffer(source);
+        const destination = try destination_runner.alloc(.system_wc, destination_offset + byte_count + 1);
+        defer destination_runner.freeBuffer(destination);
+
+        for (source.bytes[source_offset..][0..byte_count], 0..) |*byte, index| {
+            byte.* = @truncate(index *% 131 +% 17);
+        }
+        try source_runner.publishHostWrites(source, source_offset, byte_count);
+        @memset(destination.bytes, 0xa5);
+        try destination_runner.publishHostWrites(destination, 0, destination.bytes.len);
+
+        const peer = try destination_runner.importPeer(&source_runner, source);
+        defer destination_runner.releasePeer(peer);
+        try destination_runner.copyFromPeer(destination, destination_offset, peer, source_offset, byte_count);
+
+        const destination_bytes: [*]const volatile u8 = @ptrCast(destination.bytes.ptr);
+        try std.testing.expectEqual(@as(u8, 0xa5), destination_bytes[destination_offset - 1]);
+        for (0..byte_count) |index| {
+            try std.testing.expectEqual(
+                @as(u8, @truncate(index *% 131 +% 17)),
+                destination_bytes[destination_offset + index],
+            );
+        }
+        try std.testing.expectEqual(@as(u8, 0xa5), destination_bytes[destination_offset + byte_count]);
+    }
 }
 
 test "live: freeBuffer releases its tracked CPU and GPU mappings" {
