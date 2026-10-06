@@ -28,12 +28,13 @@ const INVALIDATE_SHADER_CACHES = 0x021c;
 const LINE_LENGTH_IN = 0x0180; // + LINE_COUNT, OFFSET_OUT_UPPER, OFFSET_OUT, PITCH_OUT
 const I2M_LAUNCH_DMA = 0x01b0;
 const LOAD_INLINE_DATA = 0x01b4;
-// DST_MEMORY_LAYOUT = PITCH, COMPLETION_TYPE = FLUSH_ONLY, everything else off.
+const SET_I2M_SEMAPHORE_A = 0x01dc;
 const I2M_LAUNCH_PITCH_FLUSH: sdk.NvV32 = 0x11;
+const I2M_LAUNCH_PITCH_RELEASE: sdk.NvV32 = 0x1021;
 // INSTRUCTION | LOCKS | FLUSH_DATA | DATA | CONSTANT
 const INVALIDATE_ALL_SHADER_CACHES: sdk.NvV32 = 0x1017;
 const PCAS_INVALIDATE_COPY_SCHEDULE = 3;
-const WFI = 0x0078; // host method, wait for engine idle
+const WFI = 0x0078;
 
 /// Set `width` QMD bits at bit offset `lo` (the clcdc0qmd.h MW(hi:lo) ranges map
 /// to lo = the low bit, width = hi - lo + 1).
@@ -60,6 +61,81 @@ pub const Grid = struct {
     cbuf0_size: u32 = 0, // constant bank 0 byte size (>= the highest LDC offset read)
     shared_mem_bytes: u32 = 0, // shared memory per CTA; LDS/STS fault without it
 };
+
+const GridRelease = struct {
+    sem_va: u64,
+    payload: u32,
+};
+
+fn setGridRelease(qmd: *[QMD_DWORDS]u32, release: GridRelease) !void {
+    if (release.sem_va % 4 != 0 or release.sem_va >> 57 != 0) {
+        return error.InvalidSemaphoreAddress;
+    }
+    if (release.payload == 0) return error.InvalidSemaphorePayload;
+
+    qset(qmd, 288, 1, 1); // RELEASE_ENABLE(0)
+    qset(qmd, 289, 2, 1); // RELEASE_STRUCTURE_SIZE(0) = SEMAPHORE_ONE_WORD
+    qset(qmd, 291, 1, 1); // RELEASE_MEMBAR_TYPE(0) = FE_SYSMEMBAR
+    qset(qmd, 480, 32, @truncate(release.sem_va));
+    qset(qmd, 512, 25, release.sem_va >> 32);
+    qset(qmd, 544, 32, release.payload);
+}
+
+fn qget(qmd: []const u32, lo: usize, width: usize) u64 {
+    var value: u64 = 0;
+    for (0..width) |i| {
+        const bit = lo + i;
+        value |= @as(u64, (qmd[bit / 32] >> @intCast(bit % 32)) & 1) << @intCast(i);
+    }
+    return value;
+}
+
+test "QMD slot zero releases one word through a front-end system barrier" {
+    var qmd: [QMD_DWORDS]u32 = undefined;
+    buildQmd(&qmd, .{});
+    const sem_va: u64 = 0x0123_4567_89ab_cdec;
+    try setGridRelease(&qmd, .{ .sem_va = sem_va, .payload = 0xcafe_babe });
+
+    try std.testing.expectEqual(@as(u64, 1), qget(&qmd, 288, 1));
+    try std.testing.expectEqual(@as(u64, 1), qget(&qmd, 289, 2));
+    try std.testing.expectEqual(@as(u64, 1), qget(&qmd, 291, 1));
+    try std.testing.expectEqual(@as(u64, 0), qget(&qmd, 292, 12));
+    try std.testing.expectEqual(@as(u64, 0), qget(&qmd, 304, 32));
+    try std.testing.expectEqual(@as(u64, @as(u32, @truncate(sem_va))), qget(&qmd, 480, 32));
+    try std.testing.expectEqual(sem_va >> 32, qget(&qmd, 512, 25));
+    try std.testing.expectEqual(@as(u64, 0xcafe_babe), qget(&qmd, 544, 32));
+    try std.testing.expectEqual(@as(u64, 0), qget(&qmd, 576, 32));
+}
+
+test "QMD release rejects an unrepresentable semaphore" {
+    var qmd: [QMD_DWORDS]u32 = undefined;
+    buildQmd(&qmd, .{});
+
+    try std.testing.expectError(
+        error.InvalidSemaphoreAddress,
+        setGridRelease(&qmd, .{ .sem_va = 3, .payload = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidSemaphoreAddress,
+        setGridRelease(&qmd, .{ .sem_va = @as(u64, 1) << 57, .payload = 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidSemaphorePayload,
+        setGridRelease(&qmd, .{ .sem_va = 4, .payload = 0 }),
+    );
+}
+
+test "batch QMD releases use distinct semaphore words" {
+    const base: u64 = 0x1234_0000;
+    var addresses: [4]u64 = undefined;
+    for (&addresses, 0..) |*address, i| {
+        var qmd: [QMD_DWORDS]u32 = undefined;
+        buildQmd(&qmd, .{});
+        try setGridRelease(&qmd, .{ .sem_va = base + i * 4, .payload = 9 });
+        address.* = qget(&qmd, 480, 32) | (qget(&qmd, 512, 25) << 32);
+    }
+    try std.testing.expectEqualSlices(u64, &.{ base, base + 4, base + 8, base + 12 }, &addresses);
+}
 
 /// Fill a zeroed 64-dword (256-byte) QMD to launch `g`. The QMD must then be
 /// placed at a 256-byte-aligned GPU VA and handed to `Stream.dispatch`.
@@ -166,16 +242,41 @@ pub const Stream = struct {
     /// `dst_va` must be 4-byte aligned. The caller's buffer has to hold
     /// `data.len + 8` dwords or so of headers on top of the payload.
     pub fn uploadInline(self: *Stream, dst_va: u64, data: []const u32) void {
-        std.debug.assert(dst_va % 4 == 0);
         if (data.len == 0) return;
+        std.debug.assert(dst_va % 4 == 0);
+        self.uploadInlineGeometry(dst_va, data.len);
+        self.m1(I2M_LAUNCH_DMA, I2M_LAUNCH_PITCH_FLUSH);
+        self.uploadInlinePayload(data);
+    }
+
+    fn uploadInlineRelease(self: *Stream, dst_va: u64, data: []const u32, release: GridRelease) !void {
+        if (data.len == 0) return;
+        std.debug.assert(dst_va % 4 == 0);
+        if (release.sem_va % 4 != 0 or release.sem_va >> 57 != 0) {
+            return error.InvalidSemaphoreAddress;
+        }
+        if (release.payload == 0) return error.InvalidSemaphorePayload;
+        self.uploadInlineGeometry(dst_va, data.len);
+        self.mm(SET_I2M_SEMAPHORE_A, &.{
+            @intCast(release.sem_va >> 32),
+            @truncate(release.sem_va),
+            release.payload,
+        });
+        self.m1(I2M_LAUNCH_DMA, I2M_LAUNCH_PITCH_RELEASE);
+        self.uploadInlinePayload(data);
+    }
+
+    fn uploadInlineGeometry(self: *Stream, dst_va: u64, words: usize) void {
         self.mm(LINE_LENGTH_IN, &.{
-            @intCast(data.len * 4), // LINE_LENGTH_IN, in bytes
+            @intCast(words * 4), // LINE_LENGTH_IN, in bytes
             1, // LINE_COUNT: one line
             @intCast(dst_va >> 32), // OFFSET_OUT_UPPER
             @truncate(dst_va), // OFFSET_OUT
-            @intCast(data.len * 4), // PITCH_OUT
+            @intCast(words * 4), // PITCH_OUT
         });
-        self.m1(I2M_LAUNCH_DMA, I2M_LAUNCH_PITCH_FLUSH);
+    }
+
+    fn uploadInlinePayload(self: *Stream, data: []const u32) void {
         // One method header carries at most 8191 dwords, so a long payload needs
         // several. The engine keeps writing where the last chunk left off.
         var sent: usize = 0;
@@ -196,13 +297,13 @@ pub const Stream = struct {
         self.m1(SEND_SIGNALING_PCAS2_B, PCAS_INVALIDATE_COPY_SCHEDULE);
     }
 
-    /// Wait for the compute to go idle, then release `seq` to GPU VA `sem_va`
-    /// (poll it on a CPU mapping to know the grid finished).
+    /// Wait for the compute engine to go idle, then release `seq` to `sem_va`.
+    /// This raw marker is not the Runner grid visibility primitive.
     pub fn fence(self: *Stream, sem_va: u64, seq: u32) void {
         self.m1(WFI, 1);
-        const rel = sdk.gpfifo.semaphoreRelease(sem_va, seq);
-        for (rel) |w| {
-            self.buf[self.n] = w;
+        const release = sdk.gpfifo.semaphoreRelease(sem_va, seq);
+        for (release) |word| {
+            self.buf[self.n] = word;
             self.n += 1;
         }
     }
@@ -242,11 +343,12 @@ test "live: a hand-assembled SASS compute kernel runs on the SMs and stores" {
 
     var qmd: [QMD_DWORDS]u32 = undefined;
     buildQmd(&qmd, .{ .prog_va = prog_va, .register_count = asm_.registerCount() });
+    try setGridRelease(&qmd, .{ .sem_va = sem_va, .payload = 0xc0de });
 
     const userd = try c.allocMemory(dev, .vram, 0x1000);
     const gpfifo = try c.allocMemory(dev, .vram, 0x2000);
     const pbuf = try c.allocMemory(dev, .system, 0x1000);
-    const sem = try c.allocMemory(dev, .system, 0x1000);
+    const sem = try c.allocMemory(dev, .system_wc, 0x1000);
     const codem = try c.allocMemory(dev, .system_wc, 0x1000);
     const qmdm = try c.allocMemory(dev, .system_wc, 0x1000);
     const outm = try c.allocMemory(dev, .system, 0x1000);
@@ -280,7 +382,6 @@ test "live: a hand-assembled SASS compute kernel runs on the SMs and stores" {
     var s = Stream{ .buf = @as([*]u32, @ptrCast(@alignCast(pc.bytes.ptr)))[0 .. pc.bytes.len / 4] };
     s.setup();
     s.dispatch(qmd_va);
-    s.fence(sem_va, 0xc0de);
 
     const semp: *volatile u32 = @ptrCast(@alignCast(sc.bytes.ptr));
     semp.* = 0;
@@ -345,13 +446,20 @@ pub const CopyState = enum {
     quiescent_disabled,
 };
 
+/// Whether compute resources can be reused or released after a submission.
+pub const ComputeState = enum {
+    ready,
+    recovery_required,
+    quiescent_disabled,
+};
+
 const RecoveryOps = struct {
     context: *anyopaque,
     idle: *const fn (*anyopaque, u32) rm.Error!void,
     schedule: *const fn (*anyopaque) rm.Error!void,
 };
 
-fn recoverCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+fn recoverState(comptime State: type, state: *State, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
     switch (state.*) {
         .ready => return,
         .recovery_required => {
@@ -364,7 +472,7 @@ fn recoverCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Err
     state.* = .ready;
 }
 
-fn quiesceCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+fn quiesceState(comptime State: type, state: *State, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
     switch (state.*) {
         .ready, .quiescent_disabled => {},
         .recovery_required => {
@@ -372,6 +480,22 @@ fn quiesceCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Err
             state.* = .quiescent_disabled;
         },
     }
+}
+
+fn recoverCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    return recoverState(CopyState, state, timeout_us, ops);
+}
+
+fn recoverComputeState(state: *ComputeState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    return recoverState(ComputeState, state, timeout_us, ops);
+}
+
+fn quiesceCopyState(state: *CopyState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    return quiesceState(CopyState, state, timeout_us, ops);
+}
+
+fn quiesceComputeState(state: *ComputeState, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+    return quiesceState(ComputeState, state, timeout_us, ops);
 }
 
 /// The transfer size at which the copy engine overtakes the inline path on this
@@ -454,7 +578,9 @@ pub const Runner = struct {
     copy_sem: Buffer = undefined,
     copy_seq: u32 = 0,
     copy_state: CopyState = .ready,
+    compute_state: ComputeState = .ready,
     suppress_next_copy_poll: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    suppress_next_compute_poll: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     doorbell: []u8 = &.{},
     allocations: [MAX_ALLOCATIONS]Allocation = undefined,
     allocation_count: usize = 0,
@@ -535,7 +661,7 @@ pub const Runner = struct {
         self.code = try self.alloc(.system_wc, CODE_BYTES);
         self.descriptor = try self.alloc(.system_wc, MAX_BATCH * QMD_DWORDS * 4);
         self.push = try self.alloc(.system, PUSH_BYTES);
-        self.sem = try self.alloc(.system, 0x1000);
+        self.sem = try self.alloc(.system_wc, 0x1000);
 
         const ch = try self.client.allocChannel(
             dev,
@@ -563,6 +689,11 @@ pub const Runner = struct {
             .doorbell = door.bytes,
         };
         return self;
+    }
+
+    /// Return the RM identity of the physical GPU behind this Runner.
+    pub fn gpuId(self: *const Runner) u32 {
+        return self.dev.gpu_id;
     }
 
     /// Bring up the copy-engine channel on first use. It needs its own ring,
@@ -669,22 +800,33 @@ pub const Runner = struct {
         return self.copy_state;
     }
 
+    /// Report whether compute recovery is required before memory release.
+    pub fn computeState(self: *const Runner) ComputeState {
+        return self.compute_state;
+    }
+
     /// Quiesce a timed-out copy channel through RM, then make it schedulable
     /// again. An idle failure leaves all Runner resources owned and in place.
     pub fn recoverPeerCopy(self: *Runner, timeout_us: u32) rm.Error!void {
-        try self.recoverPeerCopyWith(timeout_us, self.recoveryOps());
+        try self.recoverPeerCopyWith(timeout_us, self.copyRecoveryOps());
     }
 
-    /// Tear down a Runner after first quiescing a timed-out copy channel. A
-    /// recovery failure leaves the complete Runner valid for a later retry.
+    /// Quiesce a timed-out compute channel through RM, then make it schedulable
+    /// again. An idle failure leaves all Runner resources owned and in place.
+    pub fn recoverCompute(self: *Runner, timeout_us: u32) rm.Error!void {
+        try self.recoverComputeWith(timeout_us, self.computeRecoveryOps());
+    }
+
+    /// Tear down a Runner after quiescing each timed-out engine. A recovery
+    /// failure leaves the complete Runner valid for a later retry.
     pub fn deinitChecked(self: *Runner, timeout_us: u32) rm.Error!void {
-        try self.deinitCheckedWith(timeout_us, self.recoveryOps());
+        try self.deinitCheckedWith(timeout_us, self.computeRecoveryOps(), self.copyRecoveryOps());
     }
 
-    /// Precondition: no copy is waiting for timeout recovery. Use
-    /// `deinitChecked` when `peerCopyState()` is `recovery_required`.
+    /// Precondition: neither engine is waiting for timeout recovery. Use
+    /// `deinitChecked` when either state is `recovery_required`.
     pub fn deinit(self: *Runner) void {
-        self.requireCopyReleasable();
+        self.requireResourcesReleasable();
         self.deinitQuiescent();
     }
 
@@ -695,6 +837,7 @@ pub const Runner = struct {
     }
 
     fn requireCopyReady(self: *const Runner) !void {
+        if (self.compute_state == .recovery_required) return error.ComputeRecoveryRequired;
         return switch (self.copy_state) {
             .ready => {},
             .recovery_required => error.CopyRecoveryRequired,
@@ -702,13 +845,25 @@ pub const Runner = struct {
         };
     }
 
-    fn requireCopyReleasable(self: *const Runner) void {
+    fn requireComputeReady(self: *const Runner) !void {
+        if (self.copy_state == .recovery_required) return error.CopyRecoveryRequired;
+        return switch (self.compute_state) {
+            .ready => {},
+            .recovery_required => error.ComputeRecoveryRequired,
+            .quiescent_disabled => error.ComputeChannelUnavailable,
+        };
+    }
+
+    fn requireResourcesReleasable(self: *const Runner) void {
         if (self.copy_state == .recovery_required) {
             @panic("copy recovery required before releasing Runner memory");
         }
+        if (self.compute_state == .recovery_required) {
+            @panic("compute recovery required before releasing Runner memory");
+        }
     }
 
-    fn recoveryOps(self: *Runner) RecoveryOps {
+    fn copyRecoveryOps(self: *Runner) RecoveryOps {
         return .{
             .context = self,
             .idle = idleCopyChannel,
@@ -720,7 +875,29 @@ pub const Runner = struct {
         const self: *Runner = @ptrCast(@alignCast(context));
         const channel = self.copy_channel orelse
             @panic("copy recovery requires an allocated copy channel");
-        try self.client.idleChannel(self.dev, channel, timeout_us);
+        try self.client.idleChannel(self.dev, channel, .copy0, timeout_us);
+    }
+
+    fn computeRecoveryOps(self: *Runner) RecoveryOps {
+        return .{
+            .context = self,
+            .idle = idleComputeChannel,
+            .schedule = scheduleComputeChannel,
+        };
+    }
+
+    fn idleComputeChannel(context: *anyopaque, timeout_us: u32) rm.Error!void {
+        const self: *Runner = @ptrCast(@alignCast(context));
+        const channel = self.channel orelse
+            @panic("compute recovery requires an allocated compute channel");
+        try self.client.idleChannel(self.dev, channel, .graphics, timeout_us);
+    }
+
+    fn scheduleComputeChannel(context: *anyopaque) rm.Error!void {
+        const self: *Runner = @ptrCast(@alignCast(context));
+        const channel = self.channel orelse
+            @panic("compute reschedule requires an allocated compute channel");
+        try self.client.scheduleChannel(self.dev, channel, true);
     }
 
     fn scheduleCopyChannel(context: *anyopaque) rm.Error!void {
@@ -734,14 +911,24 @@ pub const Runner = struct {
         try recoverCopyState(&self.copy_state, timeout_us, ops);
     }
 
-    fn deinitCheckedWith(self: *Runner, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
-        try quiesceCopyState(&self.copy_state, timeout_us, ops);
+    fn recoverComputeWith(self: *Runner, timeout_us: u32, ops: RecoveryOps) rm.Error!void {
+        try recoverComputeState(&self.compute_state, timeout_us, ops);
+    }
+
+    fn deinitCheckedWith(self: *Runner, timeout_us: u32, compute_ops: RecoveryOps, copy_ops: RecoveryOps) rm.Error!void {
+        try quiesceComputeState(&self.compute_state, timeout_us, compute_ops);
+        try quiesceCopyState(&self.copy_state, timeout_us, copy_ops);
         self.deinitQuiescent();
     }
 
     fn suppressNextCopyPollForTest(self: *Runner) void {
         if (!builtin.is_test) @compileError("copy poll suppression is test-only");
         self.suppress_next_copy_poll = true;
+    }
+
+    fn suppressNextComputePollForTest(self: *Runner) void {
+        if (!builtin.is_test) @compileError("compute poll suppression is test-only");
+        self.suppress_next_compute_poll = true;
     }
 
     fn releaseOwnedResources(self: *Runner) void {
@@ -863,15 +1050,14 @@ pub const Runner = struct {
     /// Release a buffer returned by `alloc`. All copies of `buffer` become
     /// invalid when this function returns.
     pub fn freeBuffer(self: *Runner, buffer: Buffer) void {
-        self.requireCopyReleasable();
+        self.requireResourcesReleasable();
         const index = self.findAllocation(buffer.memory) orelse unreachable;
         self.releaseAllocation(index);
     }
 
-    /// Dup `buffer` (owned by `src`, a different Runner on a different RM
-    /// client, possibly a different GPU) into this Runner and map it into
-    /// this Runner's own GPU VA space. The result addresses the same physical
-    /// memory as `buffer`, and nothing is copied. Release with `releasePeer`.
+    /// Dup `buffer` from another Runner's RM client and map it into this
+    /// Runner's GPU VA space. This primitive creates a mapping but does not
+    /// validate the transport topology. Release it with `releasePeer`.
     ///
     /// Host memory also gets a CPU mapping here (VRAM does not, see `Peer`),
     /// tracked through the same bookkeeping `alloc` uses. That is why
@@ -889,32 +1075,46 @@ pub const Runner = struct {
 
     /// Release a Peer returned by `importPeer`.
     pub fn releasePeer(self: *Runner, imported: Peer) void {
-        self.requireCopyReleasable();
+        self.requireResourcesReleasable();
         const index = self.findAllocation(imported.memory) orelse unreachable;
         self.releaseAllocation(index);
     }
 
-    /// Send `data` into `dst_va` through the pushbuffer and wait for it to land.
-    /// This is the small-transfer path: no source buffer and no copy engine, at
-    /// the cost of carrying the payload in the pushbuffer.
-    pub fn uploadInline(self: *Runner, dst_va: u64, data: []const u32) !void {
-        var s = Stream{ .buf = self.push.slice(u32) };
-        s.setup();
-        s.uploadInline(dst_va, data);
-        self.seq += 1;
-        s.fence(self.sem.va, self.seq);
-        return self.submitAndWait(s.dwords());
+    fn nextSequence(sequence: *u32) u32 {
+        sequence.* = if (sequence.* == std.math.maxInt(u32)) 1 else sequence.* + 1;
+        return sequence.*;
     }
 
-    /// Ring the doorbell for the pushbuffer and spin until the fence lands.
-    fn submitAndWait(self: *Runner, dwords: u32) !void {
-        const semp: *volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
-        semp.* = 0;
-        self.queue.submit(self.push.va, dwords);
-        var spins: u64 = 0;
-        while (spins < SPIN_LIMIT) : (spins += 1) {
-            if (semp.* == self.seq) return;
+    fn allCompletionsLanded(words: [*]const volatile u32, count: usize, sequence: u32) bool {
+        for (0..count) |i| {
+            if (words[i] != sequence) return false;
         }
+        return true;
+    }
+
+    /// Send `data` into `dst_va` through the pushbuffer and wait for the I2M
+    /// system-barrier release. Empty data returns without a submission.
+    pub fn uploadInline(self: *Runner, dst_va: u64, data: []const u32) !void {
+        if (data.len == 0) return;
+        try self.requireComputeReady();
+        const sequence = nextSequence(&self.seq);
+        const completion_va = self.sem.va + MAX_BATCH * @sizeOf(u32);
+        const completions: [*]volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
+        completions[MAX_BATCH] = 0;
+
+        var s = Stream{ .buf = self.push.slice(u32) };
+        s.setup();
+        try s.uploadInlineRelease(dst_va, data, .{ .sem_va = completion_va, .payload = sequence });
+        self.queue.submit(self.push.va, s.dwords());
+        const poll_completion = if (builtin.is_test) !self.suppress_next_compute_poll else true;
+        if (builtin.is_test) self.suppress_next_compute_poll = false;
+        if (poll_completion) {
+            var spins: u64 = 0;
+            while (spins < SPIN_LIMIT) : (spins += 1) {
+                if (completions[MAX_BATCH] == sequence) return;
+            }
+        }
+        self.compute_state = .recovery_required;
         return error.GridTimeout;
     }
 
@@ -925,8 +1125,8 @@ pub const Runner = struct {
         return self.runBatch(code, &.{g});
     }
 
-    /// Dispatch every grid in `grids` from one pushbuffer, with one ring of the
-    /// doorbell and one fence at the end. All of them run the same program.
+    /// Dispatch every grid in `grids` from one pushbuffer and wait for every
+    /// grid's system-barrier release. All grids run the same program.
     ///
     /// The grids are not ordered against each other: the work distributor may
     /// overlap them, so they must not write the same memory. What they save is
@@ -944,8 +1144,14 @@ pub const Runner = struct {
     /// batch that falls to about 6.2 us, so roughly two thirds of a small
     /// launch is the submission round trip rather than the launch itself.
     pub fn runBatch(self: *Runner, code: []const u32, grids: []const Grid) !void {
-        std.debug.assert(code.len * 4 <= self.code.bytes.len);
-        std.debug.assert(grids.len > 0 and grids.len <= MAX_BATCH);
+        try self.requireComputeReady();
+        if (code.len > self.code.bytes.len / @sizeOf(u32)) return error.CodeTooLarge;
+        if (grids.len == 0) return error.EmptyBatch;
+        if (grids.len > MAX_BATCH) return error.BatchTooLarge;
+
+        const sequence = nextSequence(&self.seq);
+        const completions: [*]volatile u32 = @ptrCast(@alignCast(self.sem.bytes.ptr));
+        for (0..grids.len) |i| completions[i] = 0;
         @memcpy(self.code.slice(u32)[0..code.len], code);
 
         const descriptors = self.descriptor.slice(u32);
@@ -954,6 +1160,10 @@ pub const Runner = struct {
             grid.prog_va = self.code.va;
             var qmd: [QMD_DWORDS]u32 = undefined;
             buildQmd(&qmd, grid);
+            try setGridRelease(&qmd, .{
+                .sem_va = self.sem.va + i * @sizeOf(u32),
+                .payload = sequence,
+            });
             @memcpy(descriptors[i * QMD_DWORDS ..][0..QMD_DWORDS], &qmd);
         }
 
@@ -961,11 +1171,34 @@ pub const Runner = struct {
         s.setup();
         s.invalidateShaderCaches();
         for (0..grids.len) |i| s.dispatch(self.descriptor.va + i * QMD_DWORDS * 4);
-        self.seq += 1;
-        s.fence(self.sem.va, self.seq);
-        return self.submitAndWait(s.dwords());
+        self.queue.submit(self.push.va, s.dwords());
+        const poll_completion = if (builtin.is_test) !self.suppress_next_compute_poll else true;
+        if (builtin.is_test) self.suppress_next_compute_poll = false;
+        if (poll_completion) {
+            var spins: u64 = 0;
+            while (spins < SPIN_LIMIT) : (spins += 1) {
+                if (allCompletionsLanded(completions, grids.len, sequence)) return;
+            }
+        }
+        self.compute_state = .recovery_required;
+        return error.GridTimeout;
     }
 };
+
+test "completion sequences skip zero and require every word" {
+    var sequence: u32 = 0;
+    try std.testing.expectEqual(@as(u32, 1), Runner.nextSequence(&sequence));
+    sequence = std.math.maxInt(u32);
+    try std.testing.expectEqual(@as(u32, 1), Runner.nextSequence(&sequence));
+
+    var words = [_]u32{ 7, 7, 7, 7 };
+    try std.testing.expect(Runner.allCompletionsLanded(&words, words.len, 7));
+    inline for (.{ 0, 2, 3 }) |stale| {
+        words[stale] = 0;
+        try std.testing.expect(!Runner.allCompletionsLanded(&words, words.len, 7));
+        words[stale] = 7;
+    }
+}
 
 const RecoveryEvent = enum {
     idle,
@@ -1037,6 +1270,27 @@ test "reschedule failure leaves copy quiescent and disabled" {
     try recoverCopyState(&state, 47, fake.ops());
     try std.testing.expectEqual(CopyState.ready, state);
     try std.testing.expectEqualSlices(RecoveryEvent, &.{.schedule}, fake.events[0..fake.event_count]);
+}
+
+test "compute recovery idles before it reschedules" {
+    var state: ComputeState = .recovery_required;
+    var fake = RecoveryFake{};
+
+    try recoverComputeState(&state, 49, fake.ops());
+
+    try std.testing.expectEqual(ComputeState.ready, state);
+    try std.testing.expectEqual(@as(u32, 49), fake.timeout_us);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{ .idle, .schedule }, fake.events[0..fake.event_count]);
+}
+
+test "checked compute teardown does not reschedule" {
+    var state: ComputeState = .recovery_required;
+    var fake = RecoveryFake{};
+
+    try quiesceComputeState(&state, 51, fake.ops());
+
+    try std.testing.expectEqual(ComputeState.quiescent_disabled, state);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, fake.events[0..fake.event_count]);
 }
 
 test "checked teardown quiesces without rescheduling" {
@@ -1134,11 +1388,115 @@ test "live: importPeer + copyFromPeer takes the copy-engine arm for VRAM" {
     try expectIndexPattern(dst_buf, words, 0xFACE_0000);
 }
 
-fn deinitAfterCopyTest(runner: *Runner) void {
-    switch (runner.peerCopyState()) {
-        .ready, .quiescent_disabled => runner.deinit(),
-        .recovery_required => runner.deinitChecked(1_000_000) catch
-            @panic("failed to quiesce copy engine during test cleanup"),
+test "live: weak grid stores are visible to a same-GPU peer copy" {
+    var source_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&source_runner);
+    var destination_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&destination_runner);
+    try std.testing.expectEqual(source_runner.gpuId(), destination_runner.gpuId());
+
+    const words = 128 * 1024 / @sizeOf(u32);
+    const source = try source_runner.alloc(.vram, words * @sizeOf(u32));
+    const destination = try destination_runner.alloc(.vram, words * @sizeOf(u32));
+    @memset(source.slice(u32)[0..words], 0xdead_beef);
+    @memset(destination.slice(u32)[0..words], 0xbaad_f00d);
+    const peer = try destination_runner.importPeer(&source_runner, source);
+
+    var proof: [4]u32 = undefined;
+    var proof_assembler = sass.Assembler{ .code = &proof };
+    proof_assembler.stgWeak(0, 2, 0, .bits32, .{});
+    try std.testing.expectEqualSlices(u32, &.{ 0x00007986, 0x00000002, 0x0c1009ff }, proof[0..3]);
+
+    for (0..64) |iteration| {
+        const seed: u32 = 0x9e37_0000 +% @as(u32, @intCast(iteration));
+        var code: [64]u32 = undefined;
+        var deps: [16]sass.Dep = undefined;
+        var assembler = sass.Assembler{ .code = &code, .deps = &deps };
+        assembler.s2r(2, sass.SR_TID_X, .{});
+        assembler.s2r(3, sass.SR_CTAID_X, .{});
+        assembler.imad(4, sass.Src.reg(3), sass.Src.imm(256), sass.Src.reg(2), false, .{});
+        assembler.movImm(6, @truncate(source.va), .{});
+        assembler.movImm(7, @intCast(source.va >> 32), .{});
+        assembler.imadWide(8, sass.Src.reg(4), sass.Src.imm(4), sass.Src.reg(6), false, .{});
+        assembler.movImm(10, 2654435761, .{});
+        assembler.movImm(11, seed, .{});
+        assembler.imad(12, sass.Src.reg(4), sass.Src.reg(10), sass.Src.reg(11), false, .{});
+        assembler.stgWeak(8, 12, 0, .bits32, .{});
+        assembler.exit(.{});
+        try assembler.schedule();
+
+        try source_runner.run(code[0..assembler.dwords()], .{
+            .register_count = assembler.registerCount(),
+            .grid = .{ words / 256, 1, 1 },
+            .block = .{ 256, 1, 1 },
+        });
+        try destination_runner.copyFromPeer(destination, 0, peer, 0, words * @sizeOf(u32));
+        try expectIndexPattern(destination, words, seed);
+    }
+}
+
+test "live: every batched grid release precedes a same-GPU peer copy" {
+    var source_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&source_runner);
+    var destination_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&destination_runner);
+    try std.testing.expectEqual(source_runner.gpuId(), destination_runner.gpuId());
+
+    const grids_count = 4;
+    const words_per_grid = 256;
+    const words = grids_count * words_per_grid;
+    const source = try source_runner.alloc(.vram, words * @sizeOf(u32));
+    const destination = try destination_runner.alloc(.vram, words * @sizeOf(u32));
+    @memset(source.slice(u32)[0..words], 0xdead_beef);
+    const peer = try destination_runner.importPeer(&source_runner, source);
+
+    var code: [48]u32 = undefined;
+    var deps: [12]sass.Dep = undefined;
+    var assembler = sass.Assembler{ .code = &code, .deps = &deps };
+    assembler.s2r(2, sass.SR_TID_X, .{});
+    assembler.ldc(4, .{ .bank = 0, .offset = 0 }, sass.RZ, .bits64, .{});
+    assembler.ldc(6, .{ .bank = 0, .offset = 8 }, sass.RZ, .bits32, .{});
+    assembler.imadWide(8, sass.Src.reg(2), sass.Src.imm(4), sass.Src.reg(4), false, .{});
+    assembler.movImm(10, 2654435761, .{});
+    assembler.imad(11, sass.Src.reg(2), sass.Src.reg(10), sass.Src.reg(6), false, .{});
+    assembler.stgWeak(8, 11, 0, .bits32, .{});
+    assembler.exit(.{});
+    try assembler.schedule();
+
+    var params: [grids_count]Buffer = undefined;
+    var grids: [grids_count]Grid = undefined;
+    for (&params, &grids, 0..) |*param, *grid, i| {
+        param.* = try source_runner.alloc(.system, 0x1000);
+        const values = param.slice(u32);
+        const output_va = source.va + i * words_per_grid * @sizeOf(u32);
+        values[0] = @truncate(output_va);
+        values[1] = @intCast(output_va >> 32);
+        values[2] = 0xabc0_0000 +% @as(u32, @intCast(i));
+        grid.* = .{
+            .cbuf0_va = param.va,
+            .cbuf0_size = 12,
+            .register_count = assembler.registerCount(),
+            .block = .{ words_per_grid, 1, 1 },
+        };
+    }
+
+    try source_runner.runBatch(code[0..assembler.dwords()], &grids);
+    try destination_runner.copyFromPeer(destination, 0, peer, 0, words * @sizeOf(u32));
+    for (0..grids_count) |grid_index| {
+        const seed = 0xabc0_0000 +% @as(u32, @intCast(grid_index));
+        for (0..words_per_grid) |i| {
+            const want = seed +% @as(u32, @intCast(i)) *% 2654435761;
+            try std.testing.expectEqual(want, destination.read(u32, grid_index * words_per_grid + i));
+        }
+    }
+}
+
+fn deinitAfterRecoveryTest(runner: *Runner) void {
+    if (runner.peerCopyState() == .recovery_required or runner.computeState() == .recovery_required) {
+        runner.deinitChecked(1_000_000) catch
+            @panic("failed to quiesce Runner engines during test cleanup");
+    } else {
+        runner.deinit();
     }
 }
 
@@ -1146,7 +1504,7 @@ test "live: forced copy poll timeout requires and recovers quiescence" {
     var source_runner = try Runner.init();
     defer source_runner.deinit();
     var runner = try Runner.init();
-    defer deinitAfterCopyTest(&runner);
+    defer deinitAfterRecoveryTest(&runner);
 
     const words = 1024;
     const src = try source_runner.alloc(.vram, words * 4);
@@ -1174,6 +1532,43 @@ test "live: forced copy poll timeout requires and recovers quiescence" {
     try std.testing.expectEqual(retained_allocation_count - 2, runner.allocation_count);
 }
 
+test "live: forced compute poll timeout requires and recovers quiescence" {
+    var runner = try Runner.init();
+    defer deinitAfterRecoveryTest(&runner);
+    const dst = try runner.alloc(.vram, 0x1000);
+    const payload = [_]u32{0x1234_5678};
+
+    runner.suppressNextComputePollForTest();
+    try std.testing.expectError(error.GridTimeout, runner.uploadInline(dst.va, &payload));
+    try std.testing.expectEqual(ComputeState.recovery_required, runner.computeState());
+    try std.testing.expectError(error.ComputeRecoveryRequired, runner.uploadInline(dst.va, &payload));
+    try std.testing.expectError(error.ComputeRecoveryRequired, runner.copyLinear(dst.va, dst.va, 4));
+
+    try runner.recoverCompute(1_000_000);
+    try std.testing.expectEqual(ComputeState.ready, runner.computeState());
+    try runner.uploadInline(dst.va, &payload);
+    try std.testing.expectEqual(payload[0], dst.read(u32, 0));
+}
+
+test "live: copy recovery rejects compute and inline submissions" {
+    var runner = try Runner.init();
+    defer {
+        runner.copy_state = .ready;
+        runner.deinit();
+    }
+    const dst = try runner.alloc(.vram, 0x1000);
+    var code: [4]u32 = undefined;
+    var assembler = sass.Assembler{ .code = &code };
+    assembler.exit(.{});
+    runner.copy_state = .recovery_required;
+
+    try std.testing.expectError(
+        error.CopyRecoveryRequired,
+        runner.run(code[0..assembler.dwords()], .{ .register_count = assembler.registerCount() }),
+    );
+    try std.testing.expectError(error.CopyRecoveryRequired, runner.uploadInline(dst.va, &.{1}));
+}
+
 test "live: failed checked teardown retains every Runner allocation" {
     var runner = try Runner.init();
     const allocation_count = runner.allocation_count;
@@ -1182,7 +1577,7 @@ test "live: failed checked teardown retains every Runner allocation" {
     runner.copy_state = .recovery_required;
     var fake = RecoveryFake{ .idle_error = error.ControlFailed };
 
-    try std.testing.expectError(error.ControlFailed, runner.deinitCheckedWith(61, fake.ops()));
+    try std.testing.expectError(error.ControlFailed, runner.deinitCheckedWith(61, fake.ops(), fake.ops()));
 
     try std.testing.expectEqual(CopyState.recovery_required, runner.peerCopyState());
     try std.testing.expectEqual(allocation_count, runner.allocation_count);
@@ -1190,8 +1585,38 @@ test "live: failed checked teardown retains every Runner allocation" {
     try std.testing.expectEqual(vaspace, runner.vaspace);
 
     fake = RecoveryFake{};
-    try runner.deinitCheckedWith(67, fake.ops());
+    try runner.deinitCheckedWith(67, fake.ops(), fake.ops());
     try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, fake.events[0..fake.event_count]);
+}
+
+test "live: dual recovery teardown retains resources until both engines idle" {
+    var runner = try Runner.init();
+    const allocation_count = runner.allocation_count;
+    const compute_channel = runner.channel;
+    const vaspace = runner.vaspace;
+    runner.compute_state = .recovery_required;
+    runner.copy_state = .recovery_required;
+    var compute_fake = RecoveryFake{};
+    var copy_fake = RecoveryFake{ .idle_error = error.ControlFailed };
+
+    try std.testing.expectError(
+        error.ControlFailed,
+        runner.deinitCheckedWith(69, compute_fake.ops(), copy_fake.ops()),
+    );
+
+    try std.testing.expectEqual(ComputeState.quiescent_disabled, runner.computeState());
+    try std.testing.expectEqual(CopyState.recovery_required, runner.peerCopyState());
+    try std.testing.expectEqual(allocation_count, runner.allocation_count);
+    try std.testing.expectEqual(compute_channel.?.handle, runner.channel.?.handle);
+    try std.testing.expectEqual(vaspace, runner.vaspace);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, compute_fake.events[0..compute_fake.event_count]);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, copy_fake.events[0..copy_fake.event_count]);
+
+    compute_fake = RecoveryFake{};
+    copy_fake = RecoveryFake{};
+    try runner.deinitCheckedWith(73, compute_fake.ops(), copy_fake.ops());
+    try std.testing.expectEqual(@as(usize, 0), compute_fake.event_count);
+    try std.testing.expectEqualSlices(RecoveryEvent, &.{.idle}, copy_fake.events[0..copy_fake.event_count]);
 }
 
 test "live: checked teardown from disabled does not reschedule" {
@@ -1200,7 +1625,7 @@ test "live: checked teardown from disabled does not reschedule" {
     var fake = RecoveryFake{};
 
     try std.testing.expectError(error.CopyChannelUnavailable, runner.copyLinear(0, 0, 4));
-    try runner.deinitCheckedWith(71, fake.ops());
+    try runner.deinitCheckedWith(71, fake.ops(), fake.ops());
 
     try std.testing.expectEqual(@as(usize, 0), fake.event_count);
 }
@@ -2597,7 +3022,7 @@ test "inline upload encodes a non-incrementing payload after the launch" {
     var buf: [64]u32 = undefined;
     var s = Stream{ .buf = &buf };
     const payload = [_]u32{ 0xaa, 0xbb, 0xcc };
-    s.uploadInline(0x1234_5000, &payload);
+    try s.uploadInlineRelease(0x1234_5000, &payload, .{ .sem_va = 0x3000_0000, .payload = 0xc0de });
 
     // Five contiguous geometry methods, then the launch, then the payload.
     try std.testing.expectEqual(sdk.gpfifo.methodHeader(LINE_LENGTH_IN, SUBCH, 5), buf[0]);
@@ -2605,13 +3030,28 @@ test "inline upload encodes a non-incrementing payload after the launch" {
     try std.testing.expectEqual(@as(u32, 1), buf[2]); // one line
     try std.testing.expectEqual(@as(u32, 0), buf[3]); // destination high
     try std.testing.expectEqual(@as(u32, 0x1234_5000), buf[4]); // destination low
-    try std.testing.expectEqual(sdk.gpfifo.methodHeader(I2M_LAUNCH_DMA, SUBCH, 1), buf[6]);
-    try std.testing.expectEqual(I2M_LAUNCH_PITCH_FLUSH, buf[7]);
+    try std.testing.expectEqual(sdk.gpfifo.methodHeader(SET_I2M_SEMAPHORE_A, SUBCH, 3), buf[6]);
+    try std.testing.expectEqual(@as(u32, 0), buf[7]);
+    try std.testing.expectEqual(@as(u32, 0x3000_0000), buf[8]);
+    try std.testing.expectEqual(@as(u32, 0xc0de), buf[9]);
+    try std.testing.expectEqual(sdk.gpfifo.methodHeader(I2M_LAUNCH_DMA, SUBCH, 1), buf[10]);
+    try std.testing.expectEqual(I2M_LAUNCH_PITCH_RELEASE, buf[11]);
     // The payload goes to one method address, so the header is non-incrementing.
-    try std.testing.expectEqual(sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, 3), buf[8]);
-    try std.testing.expectEqual(@as(u32, 0xaa), buf[9]);
-    try std.testing.expectEqual(@as(u32, 0xcc), buf[11]);
-    try std.testing.expectEqual(@as(u32, 12), s.dwords());
+    try std.testing.expectEqual(sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, 3), buf[12]);
+    try std.testing.expectEqual(@as(u32, 0xaa), buf[13]);
+    try std.testing.expectEqual(@as(u32, 0xcc), buf[15]);
+    try std.testing.expectEqual(@as(u32, 16), s.dwords());
+}
+
+test "empty inline upload emits no methods" {
+    var buf: [8]u32 = undefined;
+    var raw = Stream{ .buf = &buf };
+    raw.uploadInline(3, &.{});
+    try std.testing.expectEqual(@as(u32, 0), raw.dwords());
+
+    var released = Stream{ .buf = &buf };
+    try released.uploadInlineRelease(3, &.{}, .{ .sem_va = 3, .payload = 0 });
+    try std.testing.expectEqual(@as(u32, 0), released.dwords());
 }
 
 test "inline upload splits a payload too long for one method header" {
@@ -2623,13 +3063,13 @@ test "inline upload splits a payload too long for one method header" {
     defer std.testing.allocator.free(buf);
 
     var s = Stream{ .buf = buf };
-    s.uploadInline(0x2000, payload);
+    try s.uploadInlineRelease(0x2000, payload, .{ .sem_va = 0x3000, .payload = 1 });
     // The first chunk fills a header, the second carries the remainder.
     try std.testing.expectEqual(
         sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, sdk.gpfifo.MAX_METHOD_COUNT),
-        buf[8],
+        buf[12],
     );
-    const second = 9 + sdk.gpfifo.MAX_METHOD_COUNT;
+    const second = 13 + sdk.gpfifo.MAX_METHOD_COUNT;
     try std.testing.expectEqual(sdk.gpfifo.methodHeaderNonInc(LOAD_INLINE_DATA, SUBCH, 5), buf[second]);
     try std.testing.expectEqual(@as(u32, sdk.gpfifo.MAX_METHOD_COUNT), buf[second + 1]);
     try std.testing.expectEqual(@as(u32, long - 1), buf[second + 5]);
@@ -2653,6 +3093,25 @@ test "live: an inline upload lands in memory without a source buffer" {
     @memset(dst.slice(u32)[0..long.len], 0);
     try r.uploadInline(dst.va, long);
     for (long, 0..) |want, i| try std.testing.expectEqual(want, dst.read(u32, i));
+}
+
+test "live: inline upload is visible to a same-GPU peer copy" {
+    var source_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&source_runner);
+    var destination_runner = try Runner.initOn(0);
+    defer deinitAfterRecoveryTest(&destination_runner);
+    try std.testing.expectEqual(source_runner.gpuId(), destination_runner.gpuId());
+
+    const words = 4096;
+    const source = try source_runner.alloc(.vram, words * @sizeOf(u32));
+    const destination = try destination_runner.alloc(.vram, words * @sizeOf(u32));
+    const peer = try destination_runner.importPeer(&source_runner, source);
+    var payload: [words]u32 = undefined;
+    fillIndexPattern(&payload, words, 0x1250_0000);
+
+    try source_runner.uploadInline(source.va, &payload);
+    try destination_runner.copyFromPeer(destination, 0, peer, 0, words * @sizeOf(u32));
+    try expectIndexPattern(destination, words, 0x1250_0000);
 }
 
 test "live: a linear copy on the copy engine moves a buffer" {

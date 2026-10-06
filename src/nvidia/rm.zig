@@ -29,6 +29,11 @@ pub const Error = transport.Error;
 
 pub const control_device = transport.control_device;
 
+pub const IdleEngine = enum {
+    graphics,
+    copy0,
+};
+
 // Shared RM types (used by both transports and by callers). Defined once in
 // transport/types.zig; re-exported here so the public surface is unchanged.
 pub const Device = transport.Device;
@@ -221,7 +226,7 @@ pub const Client = struct {
 
     /// Deschedule one channel and wait up to `timeout_us` for its pending work
     /// to complete. Success is the RM quiescence boundary for referenced memory.
-    pub fn idleChannel(self: *Client, dev: Device, channel: Channel, timeout_us: u32) Error!void {
+    pub fn idleChannel(self: *Client, dev: Device, channel: Channel, engine: IdleEngine, timeout_us: u32) Error!void {
         if (timeout_us == 0) return error.InvalidTimeout;
         var params = sdk.IdleChannelsParams{
             .h_device = dev.device,
@@ -230,7 +235,10 @@ pub const Client = struct {
             .ph_clients = 0,
             .ph_devices = 0,
             .ph_channels = 0,
-            .flags = sdk.idle_channel_flags.COPY_CHANNEL,
+            .flags = switch (engine) {
+                .graphics => sdk.idle_channel_flags.GRAPHICS_CHANNEL,
+                .copy0 => sdk.idle_channel_flags.COPY_CHANNEL,
+            },
             .timeout_us = timeout_us,
         };
         try self.control(
@@ -466,7 +474,8 @@ test "idleChannel rejects a zero timeout before transport access" {
     var client: Client = undefined;
     const dev: Device = undefined;
     const channel: Channel = undefined;
-    try std.testing.expectError(error.InvalidTimeout, client.idleChannel(dev, channel, 0));
+    try std.testing.expectError(error.InvalidTimeout, client.idleChannel(dev, channel, .graphics, 0));
+    try std.testing.expectError(error.InvalidTimeout, client.idleChannel(dev, channel, .copy0, 0));
 }
 
 /// A submission queue over a bound+scheduled GPFIFO channel: push GP_ENTRYs to

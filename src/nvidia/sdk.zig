@@ -213,7 +213,9 @@ pub const NV0000_CTRL_CMD_IDLE_CHANNELS: NvU32 = 0x283;
 pub const idle_channel_flags = struct {
     pub const BEHAVIOR_SLEEP: NvU32 = 1;
     pub const CHANNEL_SINGLE: NvU32 = 1 << 4;
+    pub const IDLE_GRAPHICS: NvU32 = 0x4 << 8;
     pub const IDLE_CE0: NvU32 = 0x400 << 8;
+    pub const GRAPHICS_CHANNEL: NvU32 = BEHAVIOR_SLEEP | CHANNEL_SINGLE | IDLE_GRAPHICS;
     pub const COPY_CHANNEL: NvU32 = BEHAVIOR_SLEEP | CHANNEL_SINGLE | IDLE_CE0;
 };
 
@@ -571,6 +573,7 @@ test "RM struct layouts match the NVIDIA ABI" {
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(IdleChannelsParams, "ph_channels"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(IdleChannelsParams, "flags"));
     try std.testing.expectEqual(@as(usize, 44), @offsetOf(IdleChannelsParams, "timeout_us"));
+    try std.testing.expectEqual(@as(NvU32, 0x0000_0411), idle_channel_flags.GRAPHICS_CHANNEL);
     try std.testing.expectEqual(@as(NvU32, 0x0004_0011), idle_channel_flags.COPY_CHANNEL);
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(VaSpaceAllocParams));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(VaSpaceAllocParams, "va_base"));

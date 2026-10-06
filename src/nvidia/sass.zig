@@ -985,11 +985,16 @@ pub const Assembler = struct {
     // Memory
     // -----------------------------------------------------------------------
 
-    fn putGlobalAccess(w: []u32, mem_type: MemType, offset: i32) void {
+    pub const MemOrder = enum(u4) {
+        weak = 0,
+        strong_sys = 0xa,
+    };
+
+    fn putGlobalAccess(w: []u32, mem_type: MemType, offset: i32, order: MemOrder) void {
         std.debug.assert(offset >= -(1 << 23) and offset < (1 << 23));
         setBits(w, 40, 24, signedBits(offset, 24));
         setBits(w, 73, 3, @backingInt(mem_type));
-        setBits(w, 77, 4, 0xa); // order STRONG, scope SYS
+        setBits(w, 77, 4, @backingInt(order));
         setBits(w, 84, 3, 1); // eviction NORMAL
         setBits(w, 90, 1, 1); // the GPR address is a 64-bit register pair
         setBits(w, 91, 1, 1); // UGPR mode (required, or the SM traps)
@@ -1010,7 +1015,7 @@ pub const Assembler = struct {
         setBits(w, 64, 3, 0); // guard predicate = true (this field counts down)
         setBits(w, 67, 1, 0);
         setBits(w, 81, 3, PT); // no predicate destination
-        putGlobalAccess(w, mem_type, offset);
+        putGlobalAccess(w, mem_type, offset, .strong_sys);
         var dp = Dep.Builder{};
         dp.dep.pipe = .alu;
         dp.writeRun(dst, mem_type.regs());
@@ -1024,7 +1029,7 @@ pub const Assembler = struct {
     /// STG.E.STRONG.SYS [addr:addr+1 + offset], data - store to global memory
     /// through the 64-bit address in the register pair (addr, addr+1). `addr`
     /// must be even.
-    pub fn stg(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+    pub fn stgOrdered(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, order: MemOrder, ctl: Control) void {
         self.noteRun(addr, 2);
         self.noteRun(data, mem_type.regs());
         const w = self.next();
@@ -1033,7 +1038,7 @@ pub const Assembler = struct {
         setBits(w, 32, 8, data);
         setBits(w, 64, 8, URZ); // no uniform base register
         setBits(w, 72, 1, 1); // ... and it counts as 64-bit
-        putGlobalAccess(w, mem_type, offset);
+        putGlobalAccess(w, mem_type, offset, order);
         var dp = Dep.Builder{};
         dp.dep.pipe = .alu;
         dp.readRun(addr, 2);
@@ -1041,6 +1046,17 @@ pub const Assembler = struct {
         dp.dep.late_read = true;
         self.dep(dp);
         putControl(w, ctl);
+    }
+
+    /// STG.E.STRONG.SYS through a 64-bit global address.
+    pub fn stg(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        self.stgOrdered(addr, data, offset, mem_type, .strong_sys, ctl);
+    }
+
+    /// Weak STG.E through a 64-bit global address. A completion release must
+    /// publish the write before another engine consumes it.
+    pub fn stgWeak(self: *Assembler, addr: u8, data: u8, offset: i32, mem_type: MemType, ctl: Control) void {
+        self.stgOrdered(addr, data, offset, mem_type, .weak, ctl);
     }
 
     /// STG of one 32-bit register, the common case.
@@ -1333,6 +1349,14 @@ test "sass encodes the live-verified store kernel" {
     try std.testing.expectEqual(@as(u32, 0x0c1149ff), code[14]);
     // MOV R2, 0xcafe: ALU MOV (0x002) form 4 -> 0x802, dst R2, imm in word+1.
     try std.testing.expectEqual(@as(u32, 0xcafe), code[9]);
+}
+
+test "weak STG matches the pinned Vulcan encoding" {
+    var code: [4]u32 = undefined;
+    var a = Assembler{ .code = &code };
+    a.stgWeak(0, 2, 0, .bits32, .{});
+
+    try std.testing.expectEqualSlices(u32, &.{ 0x00007986, 0x00000002, 0x0c1009ff }, code[0..3]);
 }
 
 test "sass encodes MOV register-to-register" {
